@@ -10,6 +10,7 @@ Responsibilities:
 - Log rotation: 10MB per file, 3 rotations max
 """
 
+# stdlib imports first
 import asyncio
 import logging
 import logging.handlers
@@ -20,22 +21,31 @@ import time
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+# ── Logging must be configured BEFORE importing project modules ────────────────
+# briefing_engine and telegram_bot call logging.getLogger() at module level;
+# basicConfig here ensures the root logger has both file + stdout handlers
+# before any module-level code in those files runs.
+_LOG_PATH = "briefing_bot.log"
+_LOG_FMT = "[%(asctime)s] [%(name)s] [%(levelname)s]"
+_file_handler = logging.handlers.RotatingFileHandler(
+    _LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=3
+)
+_file_handler.setFormatter(logging.Formatter(_LOG_FMT))
+_stdout_handler = logging.StreamHandler(sys.stdout)
+_stdout_handler.setFormatter(logging.Formatter(_LOG_FMT))
+logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _stdout_handler])
+
+# Third-party imports
 import schedule
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 
+# Project imports (run after logging is configured)
 import briefing_engine as engine
 import telegram_bot as tbot
 
 load_dotenv()
 
-# ── Logging ────────────────────────────────────────────────────────────────────
-LOG_PATH = "briefing_bot.log"
-_handler = logging.handlers.RotatingFileHandler(
-    LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=3
-)
-_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(name)s] [%(levelname)s]"))
-logging.basicConfig(level=logging.INFO, handlers=[_handler, logging.StreamHandler(sys.stdout)])
 log = logging.getLogger("scheduler")
 
 TZ = ZoneInfo("Asia/Singapore")
@@ -85,7 +95,7 @@ def _run_morning_briefing() -> None:
 
 def _setup_schedules() -> None:
     # Times in Singapore time (SGT = UTC+8)
-    # schedule library uses local server time; on Railway set TZ=Asia/Singapore
+    # schedule library uses datetime.now() which respects the TZ env var
     schedule.every().day.at("09:00").do(_run_morning_briefing)
     schedule.every().day.at("17:00").do(_run_evening_briefing)
     log.info("[SCHEDULES_REGISTERED] [09:00_MORNING] [17:00_EVENING]")

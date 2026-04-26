@@ -31,13 +31,6 @@ import briefing_engine as engine
 
 load_dotenv()
 
-# ── Logging ────────────────────────────────────────────────────────────────────
-LOG_PATH = "briefing_bot.log"
-_handler = logging.handlers.RotatingFileHandler(
-    LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=3
-)
-_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(name)s] [%(levelname)s]"))
-logging.basicConfig(level=logging.INFO, handlers=[_handler])
 log = logging.getLogger("telegram_bot")
 
 # ── Config ─────────────────────────────────────────────────────────────────────

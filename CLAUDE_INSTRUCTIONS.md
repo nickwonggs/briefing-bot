@@ -175,3 +175,37 @@ railway logs        # Watch for startup confirmation
 - Worker process + health check pings should keep it alive
 - Monitor usage in Railway dashboard → Usage tab
 - If approaching limit, reduce briefing frequency or upgrade to Hobby tier ($20/month)
+
+## ⚠️ Persistent storage limitation
+
+Railway's free tier has **no persistent disk**. The `/data` volume in the Dockerfile is ephemeral — it resets on every redeploy or crash-restart. This affects:
+
+- **`task_state.json.enc`** (tasks added via `/add`) — **will be lost on restart**
+- **Google Tasks** (synced live from the API) — persist fine, unaffected
+
+To work around this: prefer `/add`-ing tasks via the bot and also adding them to Google Tasks directly in the app so they survive restarts. Upgrading to Railway Hobby ($20/month) enables persistent volumes.
+
+## OAuth scopes required on Google Cloud Console
+
+Three scopes must be on the OAuth consent screen (not just two):
+
+```
+https://www.googleapis.com/auth/gmail.readonly
+https://www.googleapis.com/auth/calendar.readonly
+https://www.googleapis.com/auth/tasks
+```
+
+If Google Tasks returns no results, check the consent screen has the `tasks` scope and re-run `auth_setup.py`.
+
+## Railway web app deployment (no CLI required)
+
+Since Railway is now a web app, you can deploy entirely through the dashboard:
+
+1. Push this repo to GitHub
+2. Go to railway.app → New Project → Deploy from GitHub repo
+3. Select this repo → Railway auto-detects the Dockerfile
+4. In the service settings → Variables tab, add all 6 env vars:
+   - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `GOOGLE_CREDENTIALS_JSON`,
+     `GOOGLE_TOKEN_JSON`, `ENCRYPTION_KEY`, `TZ=Asia/Singapore`
+5. In Settings → Networking, confirm health check path is `/` on port `8080`
+6. Railway auto-deploys on every push to main

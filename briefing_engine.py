@@ -24,13 +24,6 @@ import base64
 
 load_dotenv()
 
-# ── Logging ────────────────────────────────────────────────────────────────────
-LOG_PATH = "briefing_bot.log"
-_handler = logging.handlers.RotatingFileHandler(
-    LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=3
-)
-_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(name)s] [%(levelname)s]"))
-logging.basicConfig(level=logging.INFO, handlers=[_handler])
 log = logging.getLogger("engine")
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -41,7 +34,8 @@ SCOPES = [
     "https://www.googleapis.com/auth/tasks",
 ]
 REQUIRED_ACCOUNT = "nickwys@sph.com.sg"
-TASK_FILE = "task_state.json.enc"
+_DATA_DIR = os.getenv("TASK_DATA_DIR", ".")
+TASK_FILE = os.path.join(_DATA_DIR, "task_state.json.enc")
 AUTO_ARCHIVE_DAYS = 14
 
 SPAM_PATTERNS = re.compile(
@@ -415,11 +409,12 @@ def fetch_calendar_events(target_date: date, is_weekend: bool) -> list[dict]:
         cal_name = cal.get("summary", "")
         cal_id = cal.get("id", "")
 
-        # Weekend enforcement: skip work calendar entirely at API level
-        if is_weekend and not _is_personal_calendar(cal_name):
-            if "work" in cal_name.lower() or cal_id.lower() == REQUIRED_ACCOUNT.lower():
-                log.info("[FETCH_CALENDAR] [SKIP_WORK_WEEKEND]")
-                continue
+        # Weekend enforcement: skip Work calendar only (Birthdays/Holidays included)
+        if is_weekend and (
+            "work" in cal_name.lower() or cal_id.lower() == REQUIRED_ACCOUNT.lower()
+        ):
+            log.info("[FETCH_CALENDAR] [SKIP_WORK_WEEKEND]")
+            continue
 
         tag = _tag_calendar(cal_name)
 
@@ -438,13 +433,21 @@ def fetch_calendar_events(target_date: date, is_weekend: bool) -> list[dict]:
 
         for ev in ev_items:
             start = ev.get("start", {})
+            end = ev.get("end", {})
             all_day = "date" in start and "dateTime" not in start
 
             if all_day:
                 time_str = "All day"
+                start_dt_obj = None
+                end_dt_obj = None
             else:
-                dt = datetime.fromisoformat(start.get("dateTime", "")).astimezone(TZ)
-                time_str = dt.strftime("%I:%M %p")
+                start_dt_obj = datetime.fromisoformat(start.get("dateTime", "")).astimezone(TZ)
+                time_str = start_dt_obj.strftime("%I:%M %p")
+                end_str = end.get("dateTime", "")
+                end_dt_obj = (
+                    datetime.fromisoformat(end_str).astimezone(TZ)
+                    if end_str else start_dt_obj + timedelta(hours=1)
+                )
 
             events.append({
                 "time": time_str,
@@ -452,6 +455,8 @@ def fetch_calendar_events(target_date: date, is_weekend: bool) -> list[dict]:
                 "calendar": cal_name,
                 "tag": tag,
                 "all_day": all_day,
+                "start_dt": start_dt_obj,
+                "end_dt": end_dt_obj,
             })
 
     events.sort(key=lambda e: (e["time"] == "All day", e["time"]))
@@ -462,13 +467,15 @@ def fetch_calendar_events(target_date: date, is_weekend: bool) -> list[dict]:
 # ── Conflict detection ─────────────────────────────────────────────────────────
 
 def _detect_conflicts(events: list[dict]) -> list[str]:
-    """Flag back-to-back timed events. All-day events excluded per spec."""
+    """Flag overlapping or back-to-back (<15 min gap) timed events. All-day excluded."""
     flags = []
-    timed = [e for e in events if not e["all_day"]]
+    timed = [e for e in events if not e["all_day"] and e.get("start_dt") and e.get("end_dt")]
     for i in range(len(timed) - 1):
-        flags.append(
-            f"Back-to-back: {timed[i]['title']} → {timed[i+1]['title']}"
-        )
+        gap_min = (timed[i + 1]["start_dt"] - timed[i]["end_dt"]).total_seconds() / 60
+        if gap_min < 0:
+            flags.append(f"Overlap: {timed[i]['title']} → {timed[i+1]['title']}")
+        elif gap_min < 15:
+            flags.append(f"Back-to-back: {timed[i]['title']} → {timed[i+1]['title']}")
     return flags
 
 
