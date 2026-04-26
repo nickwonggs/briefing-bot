@@ -15,14 +15,15 @@ import re
 import time
 import logging
 import logging.handlers
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from typing import Optional
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
@@ -38,13 +39,18 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ALLOWED_CHAT_ID_STR = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 _TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{35,}$")
-_SAFE_TEXT_RE = re.compile(r"[^a-zA-Z0-9 ,.\-_/@#!\?]")
+_SAFE_TEXT_RE = re.compile(r"[^a-zA-Z0-9 ,.\-_/@#!\?':()+&=]")
 
 MAX_COMMAND_LEN = 500
 MAX_ADD_LEN = 200
 RATE_LIMIT_SECONDS = 3
 GENERIC_ERROR = "Something went wrong. Please try again later."
 UNKNOWN_CMD = "Unknown command. Send /help for the list."
+
+# ── In-memory state ────────────────────────────────────────────────────────────
+_last_command_time: dict[int, float] = {}
+_processed_update_ids: set[int] = set()
+_task_dropdown_cache: dict[int, dict] = {}  # chat_id → {"personal": [...], "work": [...]}
 
 
 def validate_token() -> None:
@@ -59,11 +65,6 @@ def _get_allowed_chat_id() -> Optional[int]:
         return int(ALLOWED_CHAT_ID_STR)
     except (ValueError, TypeError):
         return None
-
-
-# ── In-memory security state ───────────────────────────────────────────────────
-_last_command_time: dict[int, float] = {}
-_processed_update_ids: set[int] = set()
 
 
 def _sanitise(text: str, max_len: int = MAX_COMMAND_LEN) -> str:
@@ -95,7 +96,6 @@ def _is_replay(update_id: int) -> bool:
         log.info("[REPLAY_PREVENTION] [DUPLICATE_UPDATE_ID]")
         return True
     _processed_update_ids.add(update_id)
-    # Keep set bounded to last 10k IDs
     if len(_processed_update_ids) > 10000:
         oldest = min(_processed_update_ids)
         _processed_update_ids.discard(oldest)
@@ -103,10 +103,7 @@ def _is_replay(update_id: int) -> bool:
 
 
 async def _guard(update: Update) -> bool:
-    """
-    Returns True if the update should be processed.
-    Silent drop + log for all security violations.
-    """
+    """Returns True if the update should be processed. Silent drop for violations."""
     if update.update_id and _is_replay(update.update_id):
         return False
 
@@ -118,10 +115,10 @@ async def _guard(update: Update) -> bool:
 
     if not _is_authorised(chat_id):
         log.warning(f"[UNAUTHORISED_ACCESS] [CHAT_ID_BLOCKED] [{datetime.now(timezone.utc).isoformat()}]")
-        return False  # Silent drop — no response
+        return False
 
     if _is_rate_limited(chat_id):
-        return False  # Silent drop
+        return False
 
     text = msg.text or ""
     if len(text) > MAX_COMMAND_LEN:
@@ -130,6 +127,50 @@ async def _guard(update: Update) -> bool:
         return False
 
     return True
+
+
+async def _guard_callback(update: Update) -> bool:
+    """Guard for callback query handlers."""
+    query = update.callback_query
+    if not query:
+        return False
+    chat_id = query.message.chat_id if query.message else None
+    if chat_id is None or not _is_authorised(chat_id):
+        await query.answer()
+        return False
+    return True
+
+
+def _build_done_keyboard(chat_id: int) -> Optional[InlineKeyboardMarkup]:
+    """Build inline keyboard for /done, caching task lists per chat_id."""
+    try:
+        tasks = engine.get_tasks_for_dropdown()
+        _task_dropdown_cache[chat_id] = tasks
+    except Exception:
+        log.error("[DONE_KEYBOARD] [FETCH_FAIL]")
+        return None
+
+    personal = tasks.get("personal", [])
+    work = tasks.get("work", [])
+
+    if not personal and not work:
+        return None
+
+    buttons = []
+    if personal:
+        buttons.append([InlineKeyboardButton("— Personal Tasks —", callback_data="noop")])
+        for i, t in enumerate(personal[:10]):
+            label = t["title"][:40] + ("…" if len(t["title"]) > 40 else "")
+            buttons.append([InlineKeyboardButton(f"✅ {label}", callback_data=f"dp:{i}")])
+
+    if work:
+        buttons.append([InlineKeyboardButton("— Work Tasks —", callback_data="noop")])
+        for i, t in enumerate(work[:10]):
+            label = t["title"][:40] + ("…" if len(t["title"]) > 40 else "")
+            buttons.append([InlineKeyboardButton(f"✅ {label}", callback_data=f"dw:{i}")])
+
+    buttons.append([InlineKeyboardButton("Cancel", callback_data="noop")])
+    return InlineKeyboardMarkup(buttons)
 
 
 # ── Command handlers ───────────────────────────────────────────────────────────
@@ -144,8 +185,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/morning — Morning refresh\n"
         "/evening — Evening prep\n"
         "/tasks — Current task list\n"
-        "/done [task] — Mark task done\n"
-        "/add [task] — Add new task\n"
+        "/done — Mark task done (dropdown)\n"
+        "/add [task] — Add personal task (synced to Google Tasks)\n"
+        "/add w [task] — Add work task (local only)\n"
         "/update [text] — Log completions and new tasks\n"
         "/weekend — Personal schedule only\n"
         "/help — This list",
@@ -159,7 +201,7 @@ async def cmd_morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     log.info("[CMD_MORNING] [START]")
     try:
         briefing = engine.build_morning_briefing()
-        await update.message.reply_text(briefing, parse_mode="Markdown")
+        await update.message.reply_text(briefing, parse_mode="HTML")
         log.info("[CMD_MORNING] [OK]")
     except Exception:
         log.error("[CMD_MORNING] [FAIL]")
@@ -173,7 +215,7 @@ async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         target = engine.get_next_briefing_target()
         briefing = engine.build_evening_briefing(target)
-        await update.message.reply_text(briefing, parse_mode="Markdown")
+        await update.message.reply_text(briefing, parse_mode="HTML")
         log.info("[CMD_EVENING] [OK]")
     except Exception:
         log.error("[CMD_EVENING] [FAIL]")
@@ -185,10 +227,9 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     log.info("[CMD_TASKS] [START]")
     try:
-        from datetime import date
         today_wd = date.today().weekday()
         text = engine.get_task_list_text(weekend=(today_wd >= 5))
-        await update.message.reply_text(text, parse_mode="Markdown")
+        await update.message.reply_text(text, parse_mode="HTML")
         log.info("[CMD_TASKS] [OK]")
     except Exception:
         log.error("[CMD_TASKS] [FAIL]")
@@ -201,10 +242,19 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("[CMD_DONE] [START]")
     try:
         args = update.message.text.partition(" ")[2].strip()
-        task_name = _sanitise(args, MAX_COMMAND_LEN)
-        if not task_name:
-            await update.message.reply_text("Usage: /done [task name]")
+        if not args:
+            # Show dropdown keyboard
+            chat_id = update.message.chat_id
+            keyboard = _build_done_keyboard(chat_id)
+            if keyboard is None:
+                await update.message.reply_text("No active tasks found. Use /add to create one.")
+                return
+            await update.message.reply_text("Select a task to mark as done:", reply_markup=keyboard)
+            log.info("[CMD_DONE] [DROPDOWN_SHOWN]")
             return
+
+        # Fuzzy match fallback when task name given as text
+        task_name = _sanitise(args, MAX_COMMAND_LEN)
         matched = engine.mark_task_done(task_name)
         if matched:
             await update.message.reply_text(f"✅ Marked done: {matched}")
@@ -216,19 +266,106 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(GENERIC_ERROR)
 
 
+async def cb_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline keyboard selections from /done dropdown."""
+    query = update.callback_query
+    await query.answer()
+
+    if not await _guard_callback(update):
+        return
+
+    data = query.data or ""
+    chat_id = query.message.chat_id
+
+    if data == "noop":
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        return
+
+    cached = _task_dropdown_cache.get(chat_id)
+    if not cached:
+        await query.edit_message_text("Session expired. Please run /done again.")
+        return
+
+    if data.startswith("dp:"):
+        idx = int(data[3:])
+        tasks = cached.get("personal", [])
+        label = "Personal"
+    elif data.startswith("dw:"):
+        idx = int(data[3:])
+        tasks = cached.get("work", [])
+        label = "Work"
+    else:
+        return
+
+    if idx >= len(tasks):
+        await query.edit_message_text("Task not found. Please run /done again.")
+        return
+
+    task = tasks[idx]
+    title = task["title"]
+    success = False
+
+    if task["source"] == "google":
+        success = engine.mark_google_task_done_by_id(
+            task["task_list_id"], task["task_id"], task["label"]
+        )
+    else:
+        # Local task — also sync to personal Google Tasks if personal
+        success = engine.mark_local_task_done_by_title(title)
+        if label == "Personal" and success:
+            # No need to sync to Google — it was local-only personal; nothing to delete remotely
+
+            pass
+
+    if success:
+        await query.edit_message_text(f"✅ Marked done: {title}")
+        log.info(f"[CB_DONE] [{label}] [OK]")
+    else:
+        await query.edit_message_text(f"Could not mark done: {title}. Try again or use /done [task name].")
+        log.error(f"[CB_DONE] [{label}] [FAIL]")
+
+    # Clear cache entry for this chat
+    _task_dropdown_cache.pop(chat_id, None)
+
+
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update):
         return
     log.info("[CMD_ADD] [START]")
     try:
         args = update.message.text.partition(" ")[2].strip()
+        if not args:
+            await update.message.reply_text(
+                "Usage:\n"
+                "  /add [task] — personal task (synced to Google Tasks)\n"
+                "  /add w [task] — work task (local only)"
+            )
+            return
+
+        # Detect work prefix
+        is_work = False
+        if args.lower().startswith("w ") and len(args) > 2:
+            is_work = True
+            args = args[2:].strip()
+
         task_title = _sanitise(args, MAX_ADD_LEN)
         if not task_title:
-            await update.message.reply_text("Usage: /add [task description] (max 200 chars)")
+            await update.message.reply_text("Task description cannot be empty.")
             return
-        engine.add_task(task_title, source="Manual")
-        await update.message.reply_text(f"✅ Task added: {task_title}")
-        log.info("[CMD_ADD] [OK]")
+
+        if is_work:
+            engine.add_task(task_title, source="Manual", task_type="💼 Work")
+            await update.message.reply_text(f"✅ Work task added: {task_title}")
+            log.info("[CMD_ADD] [WORK] [OK]")
+        else:
+            engine.add_task(task_title, source="Manual", task_type="👤 Personal")
+            synced = engine.add_personal_google_task(task_title)
+            sync_note = " (synced to Google Tasks)" if synced else " (local only — Google sync failed)"
+            await update.message.reply_text(f"✅ Personal task added: {task_title}{sync_note}")
+            log.info(f"[CMD_ADD] [PERSONAL] [GOOGLE_SYNC={'OK' if synced else 'FAIL'}]")
     except Exception:
         log.error("[CMD_ADD] [FAIL]")
         await update.message.reply_text(GENERIC_ERROR)
@@ -260,7 +397,7 @@ async def cmd_weekend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     log.info("[CMD_WEEKEND] [START]")
     try:
         briefing = engine.build_weekend_briefing()
-        await update.message.reply_text(briefing, parse_mode="Markdown")
+        await update.message.reply_text(briefing, parse_mode="HTML")
         log.info("[CMD_WEEKEND] [OK]")
     except Exception:
         log.error("[CMD_WEEKEND] [FAIL]")
@@ -277,8 +414,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/morning — Morning refresh now\n"
         "/evening — Evening prep now\n"
         "/tasks — Full task list\n"
-        "/done [task] — Mark task done (fuzzy match)\n"
-        "/add [task] — Add new task (max 200 chars)\n"
+        "/done — Mark task done (dropdown)\n"
+        "/add [task] — Add personal task (synced to Google Tasks)\n"
+        "/add w [task] — Add work task (local only)\n"
         "/update [text] — Log completions/new tasks (max 500 chars)\n"
         "/weekend — Personal schedule only\n"
         "/help — This message",
@@ -313,6 +451,9 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("weekend", cmd_weekend))
     app.add_handler(CommandHandler("help", cmd_help))
 
+    # Inline keyboard callbacks for /done dropdown
+    app.add_handler(CallbackQueryHandler(cb_done))
+
     # Catch-all: unrecognised commands
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
@@ -329,12 +470,11 @@ async def send_message(text: str) -> None:
         log.error("[SEND_MESSAGE] [NO_CHAT_ID]")
         return
     try:
-        # Telegram message limit is 4096 chars; split if needed
         for i in range(0, len(text), 4000):
             await bot.send_message(
                 chat_id=chat_id,
                 text=text[i:i+4000],
-                parse_mode="Markdown",
+                parse_mode="HTML",
             )
         log.info("[SEND_MESSAGE] [OK]")
     except Exception:

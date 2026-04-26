@@ -2,8 +2,10 @@
 briefing_engine.py — Core data fetching, formatting, and task management.
 
 Log format: [TIMESTAMP] [ACTION] [STATUS] — never personal data.
+All user-supplied content is HTML-escaped before inclusion in briefing output.
 """
 
+import html as _html
 import os
 import json
 import logging
@@ -18,7 +20,6 @@ from dotenv import load_dotenv
 from cryptography.fernet import Fernet, InvalidToken
 import google.auth.transport.requests
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 import base64
 
@@ -47,7 +48,7 @@ SPAM_PATTERNS = re.compile(
     r"accepted this event|declined this event|tentatively accepted|"
     r"(?:accepted|declined|tentative): |invitation: |updated invitation|"
     r"has shared a calendar|shared their calendar|invited you to view|"
-    r"calendar sharing)",
+    r"calendar sharing|shared calendar)",
     re.IGNORECASE,
 )
 
@@ -63,6 +64,12 @@ CALENDAR_TAGS = {
 # Only these calendars are shown — everything else (Birthdays, Holidays, etc.) is ignored
 CALENDAR_WHITELIST_KEYWORDS = ("gym", "personal", "ryan chia", "vacation", "others")
 PERSONAL_CALENDAR_KEYWORDS = ("gym", "personal", "ryan chia", "vacation", "others")
+
+
+def _h(text) -> str:
+    """HTML-escape user-supplied content for safe Telegram HTML parse mode."""
+    return _html.escape(str(text))
+
 
 # ── Credential helpers ─────────────────────────────────────────────────────────
 
@@ -193,6 +200,42 @@ def mark_task_done(task_name: str) -> Optional[str]:
     return None
 
 
+def mark_local_task_done_by_title(title: str) -> bool:
+    """Mark the first local task with exactly this title as done. Returns True on success."""
+    tasks = load_tasks()
+    for t in tasks:
+        if t.get("title") == title and t.get("status") != "done":
+            t["status"] = "done"
+            t["done_at"] = datetime.now(TZ).isoformat()
+            save_tasks(tasks)
+            log.info("[LOCAL_TASK_DONE] [OK]")
+            return True
+    return False
+
+
+def mark_google_task_done_by_id(task_list_id: str, task_id: str, label: str) -> bool:
+    """Mark a specific Google Task as completed by IDs. label = 'Personal' | 'Work'."""
+    try:
+        if label == "Personal":
+            creds = _build_personal_credentials()
+        else:
+            creds = _build_credentials()
+        if not creds:
+            log.error(f"[MARK_GOOGLE_TASK_BY_ID] [{label}] [NO_CREDS]")
+            return False
+        service = build("tasks", "v1", credentials=creds)
+        service.tasks().patch(
+            tasklist=task_list_id,
+            task=task_id,
+            body={"status": "completed"},
+        ).execute()
+        log.info(f"[MARK_GOOGLE_TASK_BY_ID] [{label}] [OK]")
+        return True
+    except Exception:
+        log.error(f"[MARK_GOOGLE_TASK_BY_ID] [{label}] [FAIL]")
+        return False
+
+
 def _mark_google_task_done(needle: str) -> Optional[str]:
     """Search both accounts' Google Tasks and complete the best match."""
     best_title = None
@@ -259,6 +302,27 @@ def add_task(title: str, source: str = "Manual", task_type: str = "👤 Personal
     save_tasks(tasks)
 
 
+def add_personal_google_task(title: str) -> bool:
+    """Add a task to the personal Google Tasks account (wongnicholas98@gmail.com). Returns success."""
+    creds = _build_personal_credentials()
+    if not creds:
+        log.error("[ADD_PERSONAL_GOOGLE_TASK] [NO_CREDS]")
+        return False
+    try:
+        service = build("tasks", "v1", credentials=creds)
+        task_lists = service.tasklists().list(maxResults=1).execute().get("items", [])
+        if not task_lists:
+            log.error("[ADD_PERSONAL_GOOGLE_TASK] [NO_TASKLIST]")
+            return False
+        tl_id = task_lists[0]["id"]
+        service.tasks().insert(tasklist=tl_id, body={"title": title[:200]}).execute()
+        log.info("[ADD_PERSONAL_GOOGLE_TASK] [OK]")
+        return True
+    except Exception:
+        log.error("[ADD_PERSONAL_GOOGLE_TASK] [FAIL]")
+        return False
+
+
 # ── Google Tasks ──────────────────────────────────────────────────────────────
 
 def _is_due_today_or_overdue(task: dict) -> bool:
@@ -297,7 +361,7 @@ def _fetch_tasks_for_service(service, label: str) -> list[dict]:
                     try:
                         due_dt = datetime.fromisoformat(due_str.replace("Z", "+00:00"))
                         due_date_str = due_dt.strftime("%d %b")
-                        overdue = due_dt.astimezone(TZ) < now
+                        overdue = due_dt.astimezone(TZ).date() < now.date()
                     except ValueError:
                         pass
                 results.append({
@@ -305,6 +369,8 @@ def _fetch_tasks_for_service(service, label: str) -> list[dict]:
                     "due": due_date_str,
                     "due_dt": due_dt,
                     "task_list": f"{tl_name} ({label})",
+                    "task_list_id": tl_id,
+                    "task_id": task["id"],
                     "overdue": overdue,
                     "google_task": True,
                     "label": label,
@@ -338,6 +404,50 @@ def fetch_google_tasks() -> list[dict]:
 
     log.info("[FETCH_GOOGLE_TASKS] [OK]")
     return results
+
+
+def get_tasks_for_dropdown() -> dict:
+    """
+    Return structured task data for the /done inline keyboard dropdown.
+    Result: {"personal": [...], "work": [...]}
+    Each entry: {title, source ("local"|"google"), task_id|None, task_list_id|None, label}
+    """
+    tasks = load_tasks()
+    tasks = _archive_old_done_tasks(tasks)
+    google_tasks = fetch_google_tasks()
+
+    personal = []
+    work = []
+
+    for t in tasks:
+        if t.get("status") != "in_progress":
+            continue
+        if t.get("auto_generated"):
+            continue
+        typ = t.get("type", "").lower()
+        entry = {"title": t["title"], "source": "local", "task_id": None, "task_list_id": None, "label": "Personal"}
+        if "personal" in typ:
+            personal.append(entry)
+        elif "work" in typ:
+            entry["label"] = "Work"
+            work.append(entry)
+
+    for t in google_tasks:
+        if not _is_due_today_or_overdue(t):
+            continue
+        entry = {
+            "title": t["title"],
+            "source": "google",
+            "task_id": t.get("task_id"),
+            "task_list_id": t.get("task_list_id"),
+            "label": t.get("label", "Personal"),
+        }
+        if t.get("label") == "Personal":
+            personal.append(entry)
+        else:
+            work.append(entry)
+
+    return {"personal": personal, "work": work}
 
 
 # ── Gmail ──────────────────────────────────────────────────────────────────────
@@ -522,7 +632,6 @@ def fetch_calendar_events(target_date: date, is_weekend: bool) -> list[dict]:
                     if end_str else start_dt_obj + timedelta(hours=1)
                 )
 
-            # Use `or ""` to safely handle API returning description: null
             description = (ev.get("description") or "").strip()
             attachments = ev.get("attachments") or []
 
@@ -549,15 +658,17 @@ def fetch_calendar_events(target_date: date, is_weekend: bool) -> list[dict]:
 # ── Conflict detection ─────────────────────────────────────────────────────────
 
 def _detect_conflicts(events: list[dict]) -> list[str]:
-    """Flag overlapping or back-to-back (<15 min gap) timed events. All-day excluded."""
+    """Flag overlapping or back-to-back (<15 min gap) timed events. Titles are HTML-escaped."""
     flags = []
     timed = [e for e in events if not e["all_day"] and e.get("start_dt") and e.get("end_dt")]
     for i in range(len(timed) - 1):
         gap_min = (timed[i + 1]["start_dt"] - timed[i]["end_dt"]).total_seconds() / 60
+        a = _h(timed[i]["title"])
+        b = _h(timed[i + 1]["title"])
         if gap_min < 0:
-            flags.append(f"Overlap: {timed[i]['title']} → {timed[i+1]['title']}")
+            flags.append(f"Overlap: {a} → {b}")
         elif gap_min < 15:
-            flags.append(f"Back-to-back: {timed[i]['title']} → {timed[i+1]['title']}")
+            flags.append(f"Back-to-back: {a} → {b}")
     return flags
 
 
@@ -597,11 +708,7 @@ def extract_auto_tasks(emails: list[dict]) -> list[dict]:
 
 
 def extract_tasks_from_events(events: list[dict]) -> list[dict]:
-    """
-    Parse event descriptions for action items and distil them into tasks.
-    Uses 'Meeting title: action item' format to avoid Telegram Markdown bracket issues.
-    Attachment content is not read — Drive API scope would be required for that.
-    """
+    """Parse event descriptions for action items and distil them into tasks."""
     new_tasks = []
     for ev in events:
         desc = ev.get("description") or ""
@@ -613,7 +720,7 @@ def extract_tasks_from_events(events: list[dict]) -> list[dict]:
             item = match.group(1).strip()[:200]
             if item:
                 new_tasks.append({
-                    "title": f"{ev['title']}: {item}",  # no square brackets
+                    "title": f"{ev['title']}: {item}",
                     "status": "in_progress",
                     "source": "Calendar (auto)",
                     "type": "💼 Work",
@@ -628,38 +735,66 @@ def extract_tasks_from_events(events: list[dict]) -> list[dict]:
 
 def _format_task_list(tasks: list[dict], google_tasks: list[dict] = None,
                       weekend: bool = False) -> str:
-    if weekend:
-        tasks = [t for t in tasks if "personal" in t.get("type", "").lower()]
+    """Format tasks into Personal Tasks and Work Tasks sections. Work hidden on weekends."""
+    google_tasks = google_tasks or []
 
-    done = [t for t in tasks if t.get("status") == "done"]
-    in_prog = [t for t in tasks if t.get("status") == "in_progress"]
-    overdue_local = [t for t in tasks if t.get("status") == "overdue"]
-    auto_gen = [t for t in in_prog if t.get("auto_generated")]
-    in_prog_normal = [t for t in in_prog if not t.get("auto_generated")]
+    # Split local tasks by type and status
+    local_personal_active = [t for t in tasks
+                             if "personal" in t.get("type", "").lower()
+                             and t.get("status") == "in_progress"
+                             and not t.get("auto_generated")]
+    local_personal_done = [t for t in tasks
+                           if "personal" in t.get("type", "").lower()
+                           and t.get("status") == "done"]
+    local_personal_overdue = [t for t in tasks
+                              if "personal" in t.get("type", "").lower()
+                              and t.get("status") == "overdue"]
 
-    lines = ["✅ *Task Status*"]
-    lines.append("🟢 Completed: " + (", ".join(t["title"] for t in done) or "None"))
-    lines.append("🟡 In progress: " + (", ".join(t["title"] for t in in_prog_normal) or "None"))
-    lines.append("🔴 Overdue: " + (", ".join(t["title"] for t in overdue_local) or "None"))
-    if auto_gen:
-        lines.append("🆕 Auto-generated (please confirm): " +
-                      ", ".join(t["title"] for t in auto_gen))
+    local_work_active = [t for t in tasks
+                         if "work" in t.get("type", "").lower()
+                         and t.get("status") == "in_progress"
+                         and not t.get("auto_generated")]
+    local_work_overdue = [t for t in tasks
+                          if "work" in t.get("type", "").lower()
+                          and t.get("status") == "overdue"]
 
-    # Google Tasks: only overdue or due today
-    if google_tasks is not None:
-        visible = [t for t in google_tasks if _is_due_today_or_overdue(t)]
-        if visible:
-            lines.append("")
-            lines.append("📋 *Google Tasks — Due Today / Overdue*")
-            for t in visible:
-                due = f" (due {t['due']})" if t.get("due") else ""
-                emoji = "🔴" if t.get("overdue") else "🟡"
-                lines.append(f"{emoji} {t['title']}{due} ({t['task_list']})")
+    # Google Tasks due today / overdue, split by label
+    gt_personal = [t for t in google_tasks if t.get("label") == "Personal" and _is_due_today_or_overdue(t)]
+    gt_work = [t for t in google_tasks if t.get("label") == "Work" and _is_due_today_or_overdue(t)]
+
+    lines = ["👤 <b>Personal Tasks</b>"]
+    if local_personal_done:
+        lines.append("🟢 Completed: " + ", ".join(_h(t["title"]) for t in local_personal_done))
+    if local_personal_overdue:
+        lines.append("🔴 Overdue: " + ", ".join(_h(t["title"]) for t in local_personal_overdue))
+    for t in local_personal_active:
+        lines.append(f"• {_h(t['title'])}")
+    for t in gt_personal:
+        due = f" (due {_h(t['due'])})" if t.get("due") else ""
+        emoji = "🔴" if t.get("overdue") else "🟡"
+        lines.append(f"{emoji} {_h(t['title'])}{due}")
+    if (not local_personal_done and not local_personal_overdue
+            and not local_personal_active and not gt_personal):
+        lines.append("No personal tasks.")
+
+    if not weekend:
+        lines += ["", "💼 <b>Work Tasks</b>"]
+        if local_work_overdue:
+            lines.append("🔴 Overdue: " + ", ".join(_h(t["title"]) for t in local_work_overdue))
+        for t in local_work_active:
+            lines.append(f"• {_h(t['title'])}")
+        for t in gt_work:
+            due = f" (due {_h(t['due'])})" if t.get("due") else ""
+            emoji = "🔴" if t.get("overdue") else "🟡"
+            lines.append(f"{emoji} {_h(t['title'])}{due}")
+        if not local_work_overdue and not local_work_active and not gt_work:
+            lines.append("No work tasks.")
 
     return "\n".join(lines)
 
 
-def _top_priorities_split(tasks: list[dict], google_tasks: list[dict]) -> str:
+def _top_priorities_split(tasks: list[dict], google_tasks: list[dict],
+                          weekend: bool = False) -> str:
     """Return top 3 Work priorities and top 3 Personal priorities as formatted text."""
     today_gt = [t for t in google_tasks if _is_due_today_or_overdue(t)]
 
@@ -676,18 +811,20 @@ def _top_priorities_split(tasks: list[dict], google_tasks: list[dict]) -> str:
                       and not t.get("auto_generated")]
 
     def _pick3(candidates):
-        selected = candidates[:3]
-        lines = [f"{i+1}. {p['title']}" for i, p in enumerate(selected)]
+        seen = set()
+        unique = []
+        for c in candidates:
+            t = c["title"]
+            if t not in seen:
+                seen.add(t)
+                unique.append(c)
+            if len(unique) == 3:
+                break
+        lines = [f"{i+1}. {_h(p['title'])}" for i, p in enumerate(unique)]
         while len(lines) < 3:
             lines.append(f"{len(lines)+1}. (Add manually)")
         return lines
 
-    work_combined = (
-        [t for t in work_gt if t.get("overdue")] +
-        [t for t in work_local if t.get("status") == "overdue"] +
-        work_gt +
-        work_local
-    )
     personal_combined = (
         [t for t in personal_gt if t.get("overdue")] +
         [t for t in personal_local if t.get("status") == "overdue"] +
@@ -695,15 +832,26 @@ def _top_priorities_split(tasks: list[dict], google_tasks: list[dict]) -> str:
         personal_local
     )
 
-    lines = ["💼 *Work*"]
-    lines.extend(_pick3(work_combined))
-    lines += ["", "👤 *Personal*"]
+    lines = []
+
+    if not weekend:
+        work_combined = (
+            [t for t in work_gt if t.get("overdue")] +
+            [t for t in work_local if t.get("status") == "overdue"] +
+            work_gt +
+            work_local
+        )
+        lines += ["💼 <b>Work</b>"]
+        lines.extend(_pick3(work_combined))
+        lines += [""]
+
+    lines += ["👤 <b>Personal</b>"]
     lines.extend(_pick3(personal_combined))
     return "\n".join(lines)
 
 
 def _render_event_line(ev: dict) -> str:
-    """Format a single calendar event line with notes."""
+    """Format a single calendar event line with notes. Title is HTML-escaped."""
     note = ""
     if "🌴" in ev["tag"]:
         note = " — 🌴 You're on leave"
@@ -714,9 +862,9 @@ def _render_event_line(ev: dict) -> str:
     if _EVENT_ACTION_RE.search(desc_plain):
         note += " — 📋 prep items in tasks"
     if ev.get("attachments"):
-        att = ", ".join(a.get("title", "file") for a in ev["attachments"][:2])
+        att = ", ".join(_h(a.get("title", "file")) for a in ev["attachments"][:2])
         note += f" — 📎 {att}"
-    return f"{ev['time']} — {ev['title']} {ev['tag']}{note}"
+    return f"{ev['time']} — {_h(ev['title'])} {ev['tag']}{note}"
 
 
 def build_evening_briefing(target_date: date) -> str:
@@ -750,29 +898,29 @@ def build_evening_briefing(target_date: date) -> str:
     today_label = today.strftime("%A, %d %B %Y")
 
     lines = [
-        f"📅 *Evening Prep — {today_label}*",
-        f"_Preparing you for {day_label}_",
+        f"📅 <b>Evening Prep — {today_label}</b>",
+        f"<i>Preparing you for {day_label}</i>",
         "",
-        "📬 *Email Summary*",
+        "📬 <b>Email Summary</b>",
     ]
 
     for e in email_data["urgent"]:
-        lines.append(f"🔴 {e['sender']} — {e['subject']} _(action required)_")
+        lines.append(f"🔴 {_h(e['sender'])} — {_h(e['subject'])} <i>(action required)</i>")
     for e in email_data["normal"]:
-        lines.append(f"• {e['sender']} — {e['subject']}")
+        lines.append(f"• {_h(e['sender'])} — {_h(e['subject'])}")
     if email_data["deferred_count"]:
         lines.append(f"📥 {email_data['deferred_count']} work emails received — deferred to Monday")
     if not email_data["urgent"] and not email_data["normal"] and not email_data["deferred_count"]:
         lines.append("No new emails.")
 
-    lines += ["", "🗓️ *Tomorrow's Schedule*"]
+    lines += ["", "🗓️ <b>Tomorrow's Schedule</b>"]
     if events:
         for ev in events:
             lines.append(_render_event_line(ev))
     else:
         lines.append("No events scheduled.")
 
-    lines += ["", "⚠️ *Flags*"]
+    lines += ["", "⚠️ <b>Flags</b>"]
     if conflict_flags:
         for f in conflict_flags:
             lines.append(f"• {f}")
@@ -780,12 +928,16 @@ def build_evening_briefing(target_date: date) -> str:
         lines.append("• 🌴 You are on leave — adjust plans accordingly")
     if ryan_events:
         for e in ryan_events:
-            lines.append(f"• 🤝 Joint commitment with Ryan Chia: {e['title']}")
+            lines.append(f"• 🤝 Joint commitment with Ryan Chia: {_h(e['title'])}")
     if not conflict_flags and not vacation_events and not ryan_events:
         lines.append("• No flags.")
 
     lines += ["", _format_task_list(tasks, google_tasks, weekend=is_weekend_target)]
-    lines += ["", "🎯 *Top 3 Priorities for Tomorrow*", _top_priorities_split(tasks, google_tasks)]
+    lines += [
+        "",
+        "🎯 <b>Top 3 Priorities for Tomorrow</b>",
+        _top_priorities_split(tasks, google_tasks, weekend=is_weekend_target),
+    ]
 
     return "\n".join(lines)
 
@@ -820,26 +972,26 @@ def build_morning_briefing() -> str:
     today_label = today.strftime("%A, %d %B %Y")
 
     lines = [
-        f"☀️ *Morning Refresh — {today_label}*",
+        f"☀️ <b>Morning Refresh — {today_label}</b>",
         "",
-        "📬 *Overnight Emails*",
+        "📬 <b>Overnight Emails</b>",
     ]
 
     for e in email_data["urgent"]:
-        lines.append(f"🔴 {e['sender']} — {e['subject']} _(action required)_")
+        lines.append(f"🔴 {_h(e['sender'])} — {_h(e['subject'])} <i>(action required)</i>")
     for e in email_data["normal"]:
-        lines.append(f"• {e['sender']} — {e['subject']}")
+        lines.append(f"• {_h(e['sender'])} — {_h(e['subject'])}")
     if not email_data["urgent"] and not email_data["normal"]:
         lines.append("No overnight emails.")
 
-    lines += ["", "🗓️ *Today's Schedule*"]
+    lines += ["", "🗓️ <b>Today's Schedule</b>"]
     if events:
         for ev in events:
             lines.append(_render_event_line(ev))
     else:
         lines.append("No events today.")
 
-    lines += ["", "⚠️ *Flags*"]
+    lines += ["", "⚠️ <b>Flags</b>"]
     if conflict_flags:
         for f in conflict_flags:
             lines.append(f"• {f}")
@@ -847,7 +999,7 @@ def build_morning_briefing() -> str:
         lines.append("• 🌴 You are on leave")
     if ryan_events:
         for e in ryan_events:
-            lines.append(f"• 🤝 Joint commitment with Ryan Chia: {e['title']}")
+            lines.append(f"• 🤝 Joint commitment with Ryan Chia: {_h(e['title'])}")
     if not conflict_flags and not vacation_events and not ryan_events:
         lines.append("• No flags.")
 
@@ -855,11 +1007,15 @@ def build_morning_briefing() -> str:
 
     auto_tasks = [t for t in tasks if t.get("auto_generated") and t.get("status") == "in_progress"]
     if auto_tasks:
-        lines += ["", "🆕 *Auto-generated tasks (please confirm):*"]
+        lines += ["", "🆕 <b>Auto-generated tasks (please confirm):</b>"]
         for t in auto_tasks:
-            lines.append(f"  • {t['title']}")
+            lines.append(f"  • {_h(t['title'])}")
 
-    lines += ["", "🎯 *Focus for Today*", _top_priorities_split(tasks, google_tasks)]
+    lines += [
+        "",
+        "🎯 <b>Focus for Today</b>",
+        _top_priorities_split(tasks, google_tasks, weekend=is_weekend),
+    ]
 
     return "\n".join(lines)
 
@@ -871,10 +1027,10 @@ def build_weekend_briefing() -> str:
     events = fetch_calendar_events(today, is_weekend=True)
     today_label = today.strftime("%A, %d %B %Y")
 
-    lines = [f"📅 *Weekend View — {today_label}*", ""]
+    lines = [f"📅 <b>Weekend View — {today_label}</b>", ""]
     if events:
         for ev in events:
-            lines.append(f"{ev['time']} — {ev['title']} {ev['tag']}")
+            lines.append(f"{ev['time']} — {_h(ev['title'])} {ev['tag']}")
     else:
         lines.append("Nothing scheduled today. Enjoy your day!")
     return "\n".join(lines)
