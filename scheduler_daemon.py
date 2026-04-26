@@ -26,7 +26,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # basicConfig here ensures the root logger has both file + stdout handlers
 # before any module-level code in those files runs.
 _LOG_PATH = "briefing_bot.log"
-_LOG_FMT = "[%(asctime)s] [%(name)s] [%(levelname)s]"
+_LOG_FMT = "[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s"
 _file_handler = logging.handlers.RotatingFileHandler(
     _LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=3
 )
