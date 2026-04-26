@@ -1,0 +1,15 @@
+.env
+credentials.json
+token.json
+*.log
+task_state.json
+task_state.json.enc
+__pycache__/
+.DS_Store
+*.pyc
+.railway/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
