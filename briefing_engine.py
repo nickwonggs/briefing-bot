@@ -33,26 +33,33 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/tasks",
 ]
+PERSONAL_TASKS_SCOPES = ["https://www.googleapis.com/auth/tasks"]
 REQUIRED_ACCOUNT = "nickwys@sph.com.sg"
 _DATA_DIR = os.getenv("TASK_DATA_DIR", ".")
 TASK_FILE = os.path.join(_DATA_DIR, "task_state.json.enc")
 AUTO_ARCHIVE_DAYS = 14
 
+# Filters out newsletters, auto-notifications, calendar invites, and acceptances/declines
 SPAM_PATTERNS = re.compile(
     r"(noreply@|no-reply@|notifications@|donotreply@|mailer@|"
-    r"newsletter|unsubscribe|marketing|calendar-notification|"
-    r"automated|do.not.reply)",
+    r"newsletter|unsubscribe|marketing|calendar-notification|invites-noreply@|"
+    r"automated|do.not.reply|"
+    r"accepted this event|declined this event|tentatively accepted|"
+    r"(?:accepted|declined|tentative): |invitation: |updated invitation)",
     re.IGNORECASE,
 )
 
 CALENDAR_TAGS = {
-    "work":       "💼",
-    "gym":        "🏋️",
-    "personal":   "👤",
-    "ryan chia":  "🤝",
-    "vacation":   "🌴",
-    "others":     "📌",
+    "work":      "💼",
+    "gym":       "🏋️",
+    "personal":  "👤",
+    "ryan chia": "🤝",
+    "vacation":  "🌴",
+    "others":    "📌",
 }
+
+# Only these calendars are shown — everything else (Birthdays, Holidays, etc.) is skipped
+CALENDAR_WHITELIST_KEYWORDS = ("gym", "personal", "ryan chia", "vacation", "others")
 
 PERSONAL_CALENDAR_KEYWORDS = ("gym", "personal", "ryan chia", "vacation", "others")
 
@@ -67,10 +74,7 @@ def _get_fernet() -> Fernet:
 
 
 def _build_credentials() -> Credentials:
-    """
-    Reconstruct Google credentials from env vars into temp files, never disk.
-    Returns a valid Credentials object.
-    """
+    """Reconstruct work account credentials from env vars. Never persists to disk."""
     creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
     token_json = os.getenv("GOOGLE_TOKEN_JSON", "").strip()
 
@@ -78,7 +82,6 @@ def _build_credentials() -> Credentials:
         log.error("[GOOGLE_CREDENTIALS] [MISSING_ENV_VARS]")
         raise RuntimeError("GOOGLE_CREDENTIALS_JSON or GOOGLE_TOKEN_JSON not set")
 
-    # Write to temp files in the OS temp directory (not project dir)
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
         tf.write(token_json)
         token_path = tf.name
@@ -90,14 +93,35 @@ def _build_credentials() -> Credentials:
 
     if creds and creds.expired and creds.refresh_token:
         log.info("[TOKEN_REFRESH] [START]")
-        request = google.auth.transport.requests.Request()
-        creds.refresh(request)
-        # Update token env var in memory (not persisted — Railway restarts pick up
-        # the latest token from the OAuth refresh; user must re-run auth_setup.py
-        # if refresh token expires)
+        creds.refresh(google.auth.transport.requests.Request())
         log.info("[TOKEN_REFRESH] [OK]")
 
     return creds
+
+
+def _build_personal_credentials() -> Optional[Credentials]:
+    """
+    Reconstruct wongnicholas98@gmail.com credentials for Google Tasks.
+    Returns None if GOOGLE_TOKEN_JSON_PERSONAL is not set.
+    """
+    token_json = os.getenv("GOOGLE_TOKEN_JSON_PERSONAL", "").strip()
+    if not token_json:
+        return None
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
+        tf.write(token_json)
+        token_path = tf.name
+
+    try:
+        creds = Credentials.from_authorized_user_file(token_path, PERSONAL_TASKS_SCOPES)
+    finally:
+        os.unlink(token_path)
+
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(google.auth.transport.requests.Request())
+        log.info("[PERSONAL_TOKEN_REFRESH] [OK]")
+
+    return creds if creds and creds.valid else None
 
 
 def _validate_account(service) -> None:
@@ -145,7 +169,7 @@ def _archive_old_done_tasks(tasks: list[dict]) -> list[dict]:
                 try:
                     dt = datetime.fromisoformat(done_at).replace(tzinfo=TZ)
                     if dt < cutoff:
-                        continue  # silently archive
+                        continue
                 except ValueError:
                     pass
         result.append(t)
@@ -153,18 +177,13 @@ def _archive_old_done_tasks(tasks: list[dict]) -> list[dict]:
 
 
 def mark_task_done(task_name: str) -> Optional[str]:
-    """
-    Fuzzy match task name across both local task list and Google Tasks.
-    Marks done in whichever source it finds a match. Returns matched title or None.
-    """
+    """Fuzzy match across Google Tasks (both accounts) and local list. Returns matched title."""
     needle = task_name.lower().strip()
 
-    # Try Google Tasks first
     google_match = _mark_google_task_done(needle)
     if google_match:
         return google_match
 
-    # Fall back to local encrypted task list
     tasks = load_tasks()
     best = None
     best_score = 0
@@ -183,42 +202,54 @@ def mark_task_done(task_name: str) -> Optional[str]:
 
 
 def _mark_google_task_done(needle: str) -> Optional[str]:
-    """Find and complete a Google Task matching needle. Returns title or None."""
+    """Search both accounts' Google Tasks and complete the best match."""
+    best_title = None
+    best_score = 0
+    best_list_id = None
+    best_task_id = None
+    best_service = None
+
+    def _search_service(service):
+        nonlocal best_title, best_score, best_list_id, best_task_id, best_service
+        try:
+            for tl in service.tasklists().list(maxResults=20).execute().get("items", []):
+                for task in service.tasks().list(
+                    tasklist=tl["id"], showCompleted=False, maxResults=100
+                ).execute().get("items", []):
+                    title = task.get("title", "").lower()
+                    score = len([w for w in needle.split() if w in title])
+                    if score > best_score:
+                        best_score = score
+                        best_title = task.get("title")
+                        best_list_id = tl["id"]
+                        best_task_id = task["id"]
+                        best_service = service
+        except Exception:
+            log.error("[MARK_GOOGLE_TASK] [SEARCH_FAIL]")
+
     try:
-        creds = _build_credentials()
-        service = build("tasks", "v1", credentials=creds)
-        lists_result = service.tasklists().list(maxResults=20).execute()
-        task_lists = lists_result.get("items", [])
+        _search_service(build("tasks", "v1", credentials=_build_credentials()))
+    except Exception:
+        log.error("[MARK_GOOGLE_TASK] [WORK_CREDS_FAIL]")
 
-        best_title = None
-        best_score = 0
-        best_list_id = None
-        best_task_id = None
+    personal_creds = _build_personal_credentials()
+    if personal_creds:
+        try:
+            _search_service(build("tasks", "v1", credentials=personal_creds))
+        except Exception:
+            log.error("[MARK_GOOGLE_TASK] [PERSONAL_CREDS_FAIL]")
 
-        for tl in task_lists:
-            tl_id = tl["id"]
-            tasks_result = service.tasks().list(
-                tasklist=tl_id, showCompleted=False, maxResults=100
-            ).execute()
-            for task in tasks_result.get("items", []):
-                title = task.get("title", "").lower()
-                score = len([w for w in needle.split() if w in title])
-                if score > best_score:
-                    best_score = score
-                    best_title = task.get("title")
-                    best_list_id = tl_id
-                    best_task_id = task["id"]
-
-        if best_score > 0 and best_task_id:
-            service.tasks().patch(
+    if best_score > 0 and best_task_id and best_service:
+        try:
+            best_service.tasks().patch(
                 tasklist=best_list_id,
                 task=best_task_id,
                 body={"status": "completed"},
             ).execute()
             log.info("[GOOGLE_TASK_DONE] [OK]")
             return best_title
-    except Exception:
-        log.error("[GOOGLE_TASK_DONE] [FAIL]")
+        except Exception:
+            log.error("[GOOGLE_TASK_DONE] [PATCH_FAIL]")
     return None
 
 
@@ -238,31 +269,24 @@ def add_task(title: str, source: str = "Manual", task_type: str = "👤 Personal
 
 # ── Google Tasks ──────────────────────────────────────────────────────────────
 
-def fetch_google_tasks() -> list[dict]:
-    """
-    Fetch all incomplete tasks from Google Tasks.
-    Returns list of dicts: {title, due, task_list, overdue, google_task: True}
-    """
-    log.info("[FETCH_GOOGLE_TASKS] [START]")
+def _fetch_tasks_for_service(service, label: str) -> list[dict]:
+    """Fetch incomplete tasks from one Tasks API service instance."""
+    results = []
+    now = datetime.now(TZ)
     try:
-        creds = _build_credentials()
-        service = build("tasks", "v1", credentials=creds)
-        lists_result = service.tasklists().list(maxResults=20).execute()
-        task_lists = lists_result.get("items", [])
-
-        results = []
-        now = datetime.now(TZ)
-
+        task_lists = service.tasklists().list(maxResults=20).execute().get("items", [])
         for tl in task_lists:
             tl_id = tl["id"]
             tl_name = tl.get("title", "My Tasks")
-            tasks_result = service.tasks().list(
+            for task in service.tasks().list(
                 tasklist=tl_id,
                 showCompleted=False,
                 showHidden=False,
                 maxResults=100,
-            ).execute()
-            for task in tasks_result.get("items", []):
+            ).execute().get("items", []):
+                title = task.get("title", "").strip()
+                if not title:
+                    continue
                 due_str = task.get("due")
                 due_date = None
                 overdue = False
@@ -274,18 +298,43 @@ def fetch_google_tasks() -> list[dict]:
                     except ValueError:
                         pass
                 results.append({
-                    "title": task.get("title", "(no title)"),
+                    "title": title,
                     "due": due_date,
-                    "task_list": tl_name,
+                    "task_list": f"{tl_name} ({label})",
                     "overdue": overdue,
                     "google_task": True,
                 })
-
-        log.info("[FETCH_GOOGLE_TASKS] [OK]")
-        return results
     except Exception:
-        log.error("[FETCH_GOOGLE_TASKS] [FAIL]")
-        return []
+        log.error(f"[FETCH_GOOGLE_TASKS] [{label}] [FAIL]")
+    return results
+
+
+def fetch_google_tasks() -> list[dict]:
+    """Fetch incomplete tasks from both work and personal Google accounts."""
+    log.info("[FETCH_GOOGLE_TASKS] [START]")
+    results = []
+
+    # Work account (nickwys@sph.com.sg)
+    try:
+        creds = _build_credentials()
+        results.extend(_fetch_tasks_for_service(build("tasks", "v1", credentials=creds), "Work"))
+    except Exception:
+        log.error("[FETCH_GOOGLE_TASKS] [WORK] [FAIL]")
+
+    # Personal account (wongnicholas98@gmail.com) — only if token is configured
+    personal_creds = _build_personal_credentials()
+    if personal_creds:
+        try:
+            results.extend(_fetch_tasks_for_service(
+                build("tasks", "v1", credentials=personal_creds), "Personal"
+            ))
+        except Exception:
+            log.error("[FETCH_GOOGLE_TASKS] [PERSONAL] [FAIL]")
+    else:
+        log.info("[FETCH_GOOGLE_TASKS] [PERSONAL] [NO_TOKEN_CONFIGURED]")
+
+    log.info("[FETCH_GOOGLE_TASKS] [OK]")
+    return results
 
 
 # ── Gmail ──────────────────────────────────────────────────────────────────────
@@ -339,7 +388,6 @@ def fetch_emails(since_hours: int = 24) -> dict:
         if _is_spam(sender, subject):
             continue
 
-        # Age calculation
         internal_date_ms = int(msg.get("internalDate", 0))
         msg_time = datetime.fromtimestamp(internal_date_ms / 1000, tz=TZ)
         age_hours = (datetime.now(TZ) - msg_time).total_seconds() / 3600
@@ -382,11 +430,19 @@ def _is_personal_calendar(name: str) -> bool:
     return any(k in lower for k in PERSONAL_CALENDAR_KEYWORDS)
 
 
+def _is_whitelisted_calendar(cal_name: str, cal_id: str) -> bool:
+    """Return True only for the 6 approved calendars. All others are ignored."""
+    if cal_id.lower() == REQUIRED_ACCOUNT.lower():
+        return True  # Work calendar
+    lower = cal_name.lower()
+    return any(k in lower for k in CALENDAR_WHITELIST_KEYWORDS)
+
+
 def fetch_calendar_events(target_date: date, is_weekend: bool) -> list[dict]:
     """
-    Returns list of events for target_date.
-    is_weekend=True → personal calendars only (enforced at API query level).
-    Each event: {"time": str, "title": str, "calendar": str, "tag": str, "all_day": bool}
+    Returns sorted list of events for target_date from whitelisted calendars only.
+    is_weekend=True → Work calendar skipped entirely at API level.
+    Each event: {time, title, calendar, tag, all_day, start_dt, end_dt}
     """
     log.info("[FETCH_CALENDAR] [START]")
     creds = _build_credentials()
@@ -409,10 +465,12 @@ def fetch_calendar_events(target_date: date, is_weekend: bool) -> list[dict]:
         cal_name = cal.get("summary", "")
         cal_id = cal.get("id", "")
 
-        # Weekend enforcement: skip Work calendar only (Birthdays/Holidays included)
-        if is_weekend and (
-            "work" in cal_name.lower() or cal_id.lower() == REQUIRED_ACCOUNT.lower()
-        ):
+        # Whitelist: only the 6 approved calendars
+        if not _is_whitelisted_calendar(cal_name, cal_id):
+            continue
+
+        # Weekend enforcement: skip Work calendar at API level
+        if is_weekend and cal_id.lower() == REQUIRED_ACCOUNT.lower():
             log.info("[FETCH_CALENDAR] [SKIP_WORK_WEEKEND]")
             continue
 
@@ -428,10 +486,23 @@ def fetch_calendar_events(target_date: date, is_weekend: bool) -> list[dict]:
             ).execute()
             ev_items = ev_result.get("items", [])
         except Exception:
-            log.error(f"[FETCH_CALENDAR] [EVENTS_FAIL]")
+            log.error("[FETCH_CALENDAR] [EVENTS_FAIL]")
             continue
 
         for ev in ev_items:
+            # Skip events without a title
+            title = ev.get("summary", "").strip()
+            if not title:
+                continue
+
+            # Skip events the user has declined
+            declined = any(
+                a.get("self") and a.get("responseStatus") == "declined"
+                for a in ev.get("attendees", [])
+            )
+            if declined:
+                continue
+
             start = ev.get("start", {})
             end = ev.get("end", {})
             all_day = "date" in start and "dateTime" not in start
@@ -451,15 +522,21 @@ def fetch_calendar_events(target_date: date, is_weekend: bool) -> list[dict]:
 
             events.append({
                 "time": time_str,
-                "title": ev.get("summary", "(No title)"),
+                "title": title,
                 "calendar": cal_name,
                 "tag": tag,
                 "all_day": all_day,
                 "start_dt": start_dt_obj,
                 "end_dt": end_dt_obj,
+                "description": ev.get("description", "").strip(),
+                "attachments": ev.get("attachments", []),
             })
 
-    events.sort(key=lambda e: (e["time"] == "All day", e["time"]))
+    # Sort all-day events first, then timed events by actual start time
+    events.sort(key=lambda e: (
+        e["start_dt"] is not None,  # all-day (start_dt=None) sorts first
+        e["start_dt"] if e["start_dt"] else datetime.min.replace(tzinfo=TZ),
+    ))
     log.info("[FETCH_CALENDAR] [OK]")
     return events
 
@@ -487,6 +564,15 @@ _ACTION_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+# Matches action items in event descriptions — bullet points or lines with action verbs
+_EVENT_ACTION_RE = re.compile(
+    r"(?m)^\s*[-•*\d.)]*\s*"
+    r"(?:action item|action|todo|to-do|to do|follow.?up|please|"
+    r"deadline|action required|prep|prepare|review|submit|send|complete)"
+    r"[:\s]+(.{5,200})",
+    re.IGNORECASE,
+)
+
 
 def extract_auto_tasks(emails: list[dict]) -> list[dict]:
     """Extract potential tasks from email subjects. Returns list of task dicts."""
@@ -503,6 +589,34 @@ def extract_auto_tasks(emails: list[dict]) -> list[dict]:
                 "created_at": datetime.now(TZ).isoformat(),
                 "auto_generated": True,
             })
+    return new_tasks
+
+
+def extract_tasks_from_events(events: list[dict]) -> list[dict]:
+    """
+    Parse event descriptions for action items and distil them into tasks.
+    Strips HTML tags (Google Calendar sometimes sends rich-text descriptions).
+    Attachment content is not read — Drive API scope would be required for that.
+    """
+    new_tasks = []
+    for ev in events:
+        desc = ev.get("description", "")
+        if not desc:
+            continue
+        desc_plain = re.sub(r"<[^>]+>", " ", desc)  # strip HTML
+        desc_plain = re.sub(r"&[a-z]+;", " ", desc_plain)  # strip HTML entities
+        for match in _EVENT_ACTION_RE.finditer(desc_plain):
+            item = match.group(1).strip()[:200]
+            if item:
+                new_tasks.append({
+                    "title": f"[{ev['title']}] {item}",
+                    "status": "in_progress",
+                    "source": "Calendar (auto)",
+                    "type": "💼 Work",
+                    "due_date": None,
+                    "created_at": datetime.now(TZ).isoformat(),
+                    "auto_generated": True,
+                })
     return new_tasks
 
 
@@ -536,9 +650,12 @@ def _format_task_list(tasks: list[dict], google_tasks: list[dict] = None,
             for t in overdue_gt:
                 due = f" (due {t['due']})" if t.get("due") else ""
                 lines.append(f"🔴 {t['title']}{due} [{t['task_list']}]")
-        for t in pending_gt:
-            due = f" (due {t['due']})" if t.get("due") else ""
-            lines.append(f"🟡 {t['title']}{due} [{t['task_list']}]")
+        if pending_gt:
+            for t in pending_gt:
+                due = f" (due {t['due']})" if t.get("due") else ""
+                lines.append(f"🟡 {t['title']}{due} [{t['task_list']}]")
+        if not overdue_gt and not pending_gt:
+            lines.append("No pending Google Tasks.")
 
     return "\n".join(lines)
 
@@ -565,30 +682,29 @@ def build_evening_briefing(target_date: date) -> str:
     weekday = today.weekday()  # 0=Mon … 6=Sun
     is_weekend_target = target_date.weekday() >= 5
 
-    # Email fetch
-    if weekday == 4:  # Friday evening → brief Saturday
-        email_data = fetch_emails_weekend()
-    elif weekday >= 5:  # Weekend evening
+    if weekday >= 4:  # Friday or weekend evening
         email_data = fetch_emails_weekend()
     else:
         email_data = fetch_emails(since_hours=24)
 
-    # Calendar fetch
     events = fetch_calendar_events(target_date, is_weekend=is_weekend_target)
-
-    # Tasks
     tasks = load_tasks()
     tasks = _archive_old_done_tasks(tasks)
     google_tasks = fetch_google_tasks()
 
-    # Auto-task extraction from urgent emails
+    # Auto-tasks from urgent emails
     if email_data["urgent"]:
         new_auto = extract_auto_tasks(email_data["urgent"])
         if new_auto:
             tasks.extend(new_auto)
             save_tasks(tasks)
 
-    # Flags
+    # Auto-tasks from meeting descriptions
+    event_tasks = extract_tasks_from_events(events)
+    if event_tasks:
+        tasks.extend(event_tasks)
+        save_tasks(tasks)
+
     conflict_flags = _detect_conflicts(events)
     gym_events = [e for e in events if "🏋️" in e["tag"]]
     vacation_events = [e for e in events if "🌴" in e["tag"]]
@@ -623,6 +739,13 @@ def build_evening_briefing(target_date: date) -> str:
                 note = " — 🌴 You're on leave"
             elif "🤝" in ev["tag"]:
                 note = " — Joint commitment"
+            # Flag if description has action items or attachments
+            desc_plain = re.sub(r"<[^>]+>", " ", ev.get("description", ""))
+            if _EVENT_ACTION_RE.search(desc_plain):
+                note += " — 📋 prep items in tasks"
+            if ev.get("attachments"):
+                att = ", ".join(a.get("title", "file") for a in ev["attachments"][:2])
+                note += f" — 📎 {att}"
             lines.append(f"{ev['time']} — {ev['title']} {ev['tag']}{note}")
     else:
         lines.append("No events scheduled.")
@@ -632,9 +755,9 @@ def build_evening_briefing(target_date: date) -> str:
         for f in conflict_flags:
             lines.append(f"• {f}")
     if gym_events:
-        lines.append(f"• 🏋️ Gym block protected — never schedule over this")
+        lines.append("• 🏋️ Gym block protected — never schedule over this")
     if vacation_events:
-        lines.append(f"• 🌴 You are on leave — adjust plans accordingly")
+        lines.append("• 🌴 You are on leave — adjust plans accordingly")
     if ryan_events:
         for e in ryan_events:
             lines.append(f"• 🤝 Joint commitment with Ryan Chia: {e['title']}")
@@ -654,7 +777,7 @@ def build_morning_briefing() -> str:
     weekday = today.weekday()
     is_weekend = weekday >= 5
 
-    email_data = fetch_emails(since_hours=12)  # overnight only
+    email_data = fetch_emails(since_hours=12)
     events = fetch_calendar_events(today, is_weekend=is_weekend)
     tasks = load_tasks()
     tasks = _archive_old_done_tasks(tasks)
@@ -665,6 +788,11 @@ def build_morning_briefing() -> str:
         if new_auto:
             tasks.extend(new_auto)
             save_tasks(tasks)
+
+    event_tasks = extract_tasks_from_events(events)
+    if event_tasks:
+        tasks.extend(event_tasks)
+        save_tasks(tasks)
 
     conflict_flags = _detect_conflicts(events)
     gym_events = [e for e in events if "🏋️" in e["tag"]]
@@ -696,6 +824,12 @@ def build_morning_briefing() -> str:
                 note = " — 🌴 You're on leave"
             elif "🤝" in ev["tag"]:
                 note = " — Joint commitment"
+            desc_plain = re.sub(r"<[^>]+>", " ", ev.get("description", ""))
+            if _EVENT_ACTION_RE.search(desc_plain):
+                note += " — 📋 prep items in tasks"
+            if ev.get("attachments"):
+                att = ", ".join(a.get("title", "file") for a in ev["attachments"][:2])
+                note += f" — 📎 {att}"
             lines.append(f"{ev['time']} — {ev['title']} {ev['tag']}{note}")
     else:
         lines.append("No events today.")
@@ -705,9 +839,9 @@ def build_morning_briefing() -> str:
         for f in conflict_flags:
             lines.append(f"• {f}")
     if gym_events:
-        lines.append(f"• 🏋️ Gym block protected")
+        lines.append("• 🏋️ Gym block protected")
     if vacation_events:
-        lines.append(f"• 🌴 You are on leave")
+        lines.append("• 🌴 You are on leave")
     if ryan_events:
         for e in ryan_events:
             lines.append(f"• 🤝 Joint commitment with Ryan Chia: {e['title']}")
@@ -716,7 +850,6 @@ def build_morning_briefing() -> str:
 
     lines += ["", _format_task_list(tasks, google_tasks, weekend=is_weekend)]
 
-    # Morning shows updated task list with auto-generated section
     auto_tasks = [t for t in tasks if t.get("auto_generated") and t.get("status") == "in_progress"]
     if auto_tasks:
         lines.append("🆕 *New (auto-generated from emails — please confirm):*")
@@ -745,16 +878,12 @@ def build_weekend_briefing() -> str:
 
 
 def process_update(text: str) -> str:
-    """
-    Parse a /update message. Returns a reply string.
-    Input is already sanitised before this is called.
-    """
+    """Parse a /update message. Input is already sanitised before this is called."""
     tasks = load_tasks()
     marked_done = []
     added = []
     notes = []
 
-    # Simple keyword parsing
     for part in re.split(r",\s*", text):
         part = part.strip()
         if re.match(r"^(finished|completed|done)\s+", part, re.IGNORECASE):
@@ -796,13 +925,4 @@ def get_next_briefing_target() -> date:
     """Return the date the evening briefing should cover."""
     now = datetime.now(TZ)
     today = now.date()
-    weekday = today.weekday()
-
-    if weekday == 4:  # Friday → Saturday
-        return today + timedelta(days=1)
-    elif weekday == 5:  # Saturday → Sunday
-        return today + timedelta(days=1)
-    elif weekday == 6:  # Sunday → Monday
-        return today + timedelta(days=1)
-    else:  # Mon–Thu → next day
-        return today + timedelta(days=1)
+    return today + timedelta(days=1)
