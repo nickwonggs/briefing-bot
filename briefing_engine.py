@@ -52,6 +52,25 @@ SPAM_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# Out-of-office patterns matched against Work calendar all-day event titles
+_OOO_RE = re.compile(
+    r"\b(out[\s\-]of[\s\-]office|ooo|annual leave|on leave|day off|"
+    r"public holiday|medical leave|mc|sick leave|no work|off[\s\-]day|leave)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_ooo_day(events: list[dict]) -> bool:
+    """Return True if there is a Work calendar all-day OOO event in this event list."""
+    for ev in events:
+        if "💼" not in ev.get("tag", ""):
+            continue
+        if ev.get("all_day") and _OOO_RE.search(ev.get("title", "")):
+            log.info("[OOO_DETECTED] [WORK_CALENDAR]")
+            return True
+    return False
+
+
 CALENDAR_TAGS = {
     "work":      "💼",
     "gym":       "🏋️",
@@ -306,20 +325,19 @@ def add_personal_google_task(title: str) -> bool:
     """Add a task to the personal Google Tasks account (wongnicholas98@gmail.com). Returns success."""
     creds = _build_personal_credentials()
     if not creds:
-        log.error("[ADD_PERSONAL_GOOGLE_TASK] [NO_CREDS]")
+        log.error("[ADD_PERSONAL_GOOGLE_TASK] [NO_CREDS] — GOOGLE_TOKEN_JSON_PERSONAL not set or invalid")
         return False
     try:
         service = build("tasks", "v1", credentials=creds)
-        task_lists = service.tasklists().list(maxResults=1).execute().get("items", [])
-        if not task_lists:
-            log.error("[ADD_PERSONAL_GOOGLE_TASK] [NO_TASKLIST]")
-            return False
-        tl_id = task_lists[0]["id"]
-        service.tasks().insert(tasklist=tl_id, body={"title": title[:200]}).execute()
+        # "@default" always refers to the user's primary task list — no list-fetch needed
+        service.tasks().insert(
+            tasklist="@default",
+            body={"title": title[:200]},
+        ).execute()
         log.info("[ADD_PERSONAL_GOOGLE_TASK] [OK]")
         return True
-    except Exception:
-        log.error("[ADD_PERSONAL_GOOGLE_TASK] [FAIL]")
+    except Exception as exc:
+        log.error(f"[ADD_PERSONAL_GOOGLE_TASK] [FAIL] [{type(exc).__name__}]")
         return False
 
 
@@ -873,8 +891,18 @@ def build_evening_briefing(target_date: date) -> str:
     weekday = today.weekday()
     is_weekend_target = target_date.weekday() >= 5
 
-    email_data = fetch_emails_weekend() if weekday >= 4 else fetch_emails(since_hours=24)
+    # Fetch target day events first so we can detect OOO before email mode decision
     events = fetch_calendar_events(target_date, is_weekend=is_weekend_target)
+    is_ooo_tomorrow = not is_weekend_target and _is_ooo_day(events)
+    # If tomorrow is OOO or a weekend, treat work content as suppressed
+    effective_weekend = is_weekend_target or is_ooo_tomorrow
+
+    # Emails are today's (not tomorrow's), but defer if it's a Friday or OOO tomorrow
+    if weekday >= 4 or is_ooo_tomorrow:
+        email_data = fetch_emails_weekend()
+    else:
+        email_data = fetch_emails(since_hours=24)
+
     tasks = load_tasks()
     tasks = _archive_old_done_tasks(tasks)
     google_tasks = fetch_google_tasks()
@@ -900,27 +928,32 @@ def build_evening_briefing(target_date: date) -> str:
     lines = [
         f"📅 <b>Evening Prep — {today_label}</b>",
         f"<i>Preparing you for {day_label}</i>",
-        "",
-        "📬 <b>Email Summary</b>",
     ]
+    if is_ooo_tomorrow:
+        lines.append("🏖️ <i>Tomorrow is OOO — work emails and events hidden</i>")
+    lines += ["", "📬 <b>Email Summary</b>"]
 
-    for e in email_data["urgent"]:
-        lines.append(f"🔴 {_h(e['sender'])} — {_h(e['subject'])} <i>(action required)</i>")
-    for e in email_data["normal"]:
-        lines.append(f"• {_h(e['sender'])} — {_h(e['subject'])}")
     if email_data["deferred_count"]:
-        lines.append(f"📥 {email_data['deferred_count']} work emails received — deferred to Monday")
+        lines.append(f"📥 {email_data['deferred_count']} work emails received — deferred (OOO/weekend)")
+    elif not effective_weekend:
+        for e in email_data["urgent"]:
+            lines.append(f"🔴 {_h(e['sender'])} — {_h(e['subject'])} <i>(action required)</i>")
+        for e in email_data["normal"]:
+            lines.append(f"• {_h(e['sender'])} — {_h(e['subject'])}")
     if not email_data["urgent"] and not email_data["normal"] and not email_data["deferred_count"]:
         lines.append("No new emails.")
 
     lines += ["", "🗓️ <b>Tomorrow's Schedule</b>"]
-    if events:
-        for ev in events:
+    visible_events = [e for e in events if not (is_ooo_tomorrow and "💼" in e["tag"])]
+    if visible_events:
+        for ev in visible_events:
             lines.append(_render_event_line(ev))
     else:
         lines.append("No events scheduled.")
 
     lines += ["", "⚠️ <b>Flags</b>"]
+    if is_ooo_tomorrow:
+        lines.append("• 🏖️ OOO tomorrow — no work commitments shown")
     if conflict_flags:
         for f in conflict_flags:
             lines.append(f"• {f}")
@@ -929,14 +962,14 @@ def build_evening_briefing(target_date: date) -> str:
     if ryan_events:
         for e in ryan_events:
             lines.append(f"• 🤝 Joint commitment with Ryan Chia: {_h(e['title'])}")
-    if not conflict_flags and not vacation_events and not ryan_events:
+    if not is_ooo_tomorrow and not conflict_flags and not vacation_events and not ryan_events:
         lines.append("• No flags.")
 
-    lines += ["", _format_task_list(tasks, google_tasks, weekend=is_weekend_target)]
+    lines += ["", _format_task_list(tasks, google_tasks, weekend=effective_weekend)]
     lines += [
         "",
         "🎯 <b>Top 3 Priorities for Tomorrow</b>",
-        _top_priorities_split(tasks, google_tasks, weekend=is_weekend_target),
+        _top_priorities_split(tasks, google_tasks, weekend=effective_weekend),
     ]
 
     return "\n".join(lines)
@@ -948,8 +981,13 @@ def build_morning_briefing() -> str:
     weekday = today.weekday()
     is_weekend = weekday >= 5
 
-    email_data = fetch_emails(since_hours=12)
+    # Fetch events first so we can detect OOO before deciding email mode
     events = fetch_calendar_events(today, is_weekend=is_weekend)
+    is_ooo = not is_weekend and _is_ooo_day(events)
+    # Treat OOO days like weekends: skip work emails and work content
+    effective_weekend = is_weekend or is_ooo
+
+    email_data = fetch_emails_weekend() if effective_weekend else fetch_emails(since_hours=12)
     tasks = load_tasks()
     tasks = _archive_old_done_tasks(tasks)
     google_tasks = fetch_google_tasks()
@@ -973,25 +1011,32 @@ def build_morning_briefing() -> str:
 
     lines = [
         f"☀️ <b>Morning Refresh — {today_label}</b>",
-        "",
-        "📬 <b>Overnight Emails</b>",
     ]
+    if is_ooo:
+        lines.append("🏖️ <i>You are OOO today — work emails and events hidden</i>")
+    lines += ["", "📬 <b>Overnight Emails</b>"]
 
-    for e in email_data["urgent"]:
-        lines.append(f"🔴 {_h(e['sender'])} — {_h(e['subject'])} <i>(action required)</i>")
-    for e in email_data["normal"]:
-        lines.append(f"• {_h(e['sender'])} — {_h(e['subject'])}")
-    if not email_data["urgent"] and not email_data["normal"]:
+    if effective_weekend and email_data.get("deferred_count"):
+        lines.append(f"📥 {email_data['deferred_count']} work emails received — deferred (OOO/weekend)")
+    elif not effective_weekend:
+        for e in email_data["urgent"]:
+            lines.append(f"🔴 {_h(e['sender'])} — {_h(e['subject'])} <i>(action required)</i>")
+        for e in email_data["normal"]:
+            lines.append(f"• {_h(e['sender'])} — {_h(e['subject'])}")
+    if not email_data["urgent"] and not email_data["normal"] and not email_data.get("deferred_count"):
         lines.append("No overnight emails.")
 
     lines += ["", "🗓️ <b>Today's Schedule</b>"]
-    if events:
-        for ev in events:
+    visible_events = [e for e in events if not (is_ooo and "💼" in e["tag"])]
+    if visible_events:
+        for ev in visible_events:
             lines.append(_render_event_line(ev))
     else:
         lines.append("No events today.")
 
     lines += ["", "⚠️ <b>Flags</b>"]
+    if is_ooo:
+        lines.append("• 🏖️ OOO today — work commitments hidden")
     if conflict_flags:
         for f in conflict_flags:
             lines.append(f"• {f}")
@@ -1000,10 +1045,10 @@ def build_morning_briefing() -> str:
     if ryan_events:
         for e in ryan_events:
             lines.append(f"• 🤝 Joint commitment with Ryan Chia: {_h(e['title'])}")
-    if not conflict_flags and not vacation_events and not ryan_events:
+    if not is_ooo and not conflict_flags and not vacation_events and not ryan_events:
         lines.append("• No flags.")
 
-    lines += ["", _format_task_list(tasks, google_tasks, weekend=is_weekend)]
+    lines += ["", _format_task_list(tasks, google_tasks, weekend=effective_weekend)]
 
     auto_tasks = [t for t in tasks if t.get("auto_generated") and t.get("status") == "in_progress"]
     if auto_tasks:
@@ -1014,7 +1059,7 @@ def build_morning_briefing() -> str:
     lines += [
         "",
         "🎯 <b>Focus for Today</b>",
-        _top_priorities_split(tasks, google_tasks, weekend=is_weekend),
+        _top_priorities_split(tasks, google_tasks, weekend=effective_weekend),
     ]
 
     return "\n".join(lines)
