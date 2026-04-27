@@ -894,12 +894,10 @@ def summarise_emails(received: list[dict], sent: list[dict]) -> Optional[str]:
     if not received and not sent:
         return None
 
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
     if api_key:
         try:
-            from google import genai
-
-            client = genai.Client(api_key=api_key)
+            from groq import Groq
 
             lines: list[str] = []
             if received:
@@ -918,12 +916,15 @@ def summarise_emails(received: list[dict], sent: list[dict]) -> Optional[str]:
                 "Call out anything that needs attention or follow-up. "
                 "Be direct — no greetings, no sign-off:\n\n" + "\n".join(lines)
             )
-            response = client.models.generate_content(
-                model="gemini-2.0-flash-lite", contents=prompt
+            client = Groq(api_key=api_key)
+            response = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200,
             )
-            return response.text.strip()
+            return response.choices[0].message.content.strip()
         except Exception as exc:
-            log.error(f"[EMAIL_SUMMARY] [GEMINI_FAIL] [{type(exc).__name__}] {exc} — falling back to rule-based")
+            log.error(f"[EMAIL_SUMMARY] [GROQ_FAIL] [{type(exc).__name__}] {exc} — falling back to rule-based")
 
     # ── Rule-based fallback (no API key or Gemini call failed) ────────────────
     parts: list[str] = []
