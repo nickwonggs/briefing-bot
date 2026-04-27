@@ -420,20 +420,10 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             date_note = f", due {target_date.strftime('%d %b')}" if due_date else " (today)"
             rec_note  = f", repeats {rec_display}" if rec_display else ""
 
-            if rrule:
-                # Recurring → Google Calendar Event
-                ok = engine.add_personal_google_calendar_event(task_title, target_date, rrule)
-                if ok:
-                    sync_note = " 📅 Added to Google Calendar"
-                else:
-                    sync_note = (
-                        " ⚠️ Calendar sync failed — re-run auth_personal_tasks.py "
-                        "with Calendar scope and update GOOGLE_TOKEN_JSON_PERSONAL in Railway"
-                    )
-            else:
-                # Non-recurring → Google Task (appears as task strip in Calendar)
-                ok = engine.add_personal_google_task(task_title, due_date=target_date)
-                sync_note = " ✅ Synced to Google Tasks" if ok else " ⚠️ Google sync failed"
+            # Always sync as a Google Task (recurring info stored locally only —
+            # Google Tasks API does not support RRULE)
+            ok = engine.add_personal_google_task(task_title, due_date=target_date)
+            sync_note = " ✅ Synced to Google Tasks" if ok else " ⚠️ Google sync failed"
 
             await update.message.reply_text(
                 f"✅ Personal task added: {task_title}{date_note}{rec_note}\n{sync_note}"
