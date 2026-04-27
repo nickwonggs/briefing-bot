@@ -322,17 +322,24 @@ def add_task(title: str, source: str = "Manual", task_type: str = "👤 Personal
 
 
 def add_personal_google_task(title: str) -> bool:
-    """Add a task to the personal Google Tasks account (wongnicholas98@gmail.com). Returns success."""
+    """
+    Add a task to the personal Google Tasks account (wongnicholas98@gmail.com).
+    Due date is set to today (SGT) so the task appears on the Google Calendar grid.
+    Returns True on success.
+    """
     creds = _build_personal_credentials()
     if not creds:
         log.error("[ADD_PERSONAL_GOOGLE_TASK] [NO_CREDS] — GOOGLE_TOKEN_JSON_PERSONAL not set or invalid")
         return False
     try:
         service = build("tasks", "v1", credentials=creds)
-        # "@default" always refers to the user's primary task list — no list-fetch needed
+        # RFC 3339 due date — Google Tasks ignores the time portion; only the date is used.
+        # Setting this makes the task appear on the Google Calendar grid for today.
+        today_due = datetime.now(TZ).strftime("%Y-%m-%dT00:00:00.000Z")
+        # "@default" always resolves to the user's primary task list — no extra API call needed
         service.tasks().insert(
             tasklist="@default",
-            body={"title": title[:200]},
+            body={"title": title[:200], "due": today_due},
         ).execute()
         log.info("[ADD_PERSONAL_GOOGLE_TASK] [OK]")
         return True
