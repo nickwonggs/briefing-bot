@@ -886,6 +886,67 @@ def _email_display_name(full_addr: str) -> str:
     return m.group(1).strip() if m else full_addr.strip()
 
 
+def summarise_emails(received: list[dict], sent: list[dict]) -> Optional[str]:
+    """
+    Summarise emails using Gemini Flash (free tier).
+    Falls back to rule-based summary if GEMINI_API_KEY is not set or the call fails.
+    """
+    if not received and not sent:
+        return None
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if api_key:
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("gemini-1.5-flash")
+
+            lines: list[str] = []
+            if received:
+                lines.append("RECEIVED:")
+                for e in received:
+                    snip = f" | Preview: {e['snippet']}" if e.get("snippet") else ""
+                    lines.append(f"  - From: {e['sender']} | Subject: {e['subject']}{snip}")
+            if sent:
+                lines.append("SENT:")
+                for e in sent:
+                    snip = f" | Preview: {e['snippet']}" if e.get("snippet") else ""
+                    lines.append(f"  - To: {e['to']} | Subject: {e['subject']}{snip}")
+
+            prompt = (
+                "Summarise these work emails in 2–3 concise sentences. "
+                "Call out anything that needs attention or follow-up. "
+                "Be direct — no greetings, no sign-off:\n\n" + "\n".join(lines)
+            )
+            response = model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as exc:
+            log.error(f"[EMAIL_SUMMARY] [GEMINI_FAIL] [{type(exc).__name__}] — falling back to rule-based")
+
+    # ── Rule-based fallback (no API key or Gemini call failed) ────────────────
+    parts: list[str] = []
+
+    if received:
+        counts: dict[str, int] = {}
+        for e in received:
+            counts[e["sender"]] = counts.get(e["sender"], 0) + 1
+        top = sorted(counts.items(), key=lambda x: -x[1])[:3]
+        sender_str = ", ".join(f"{name} ({n})" if n > 1 else name for name, n in top)
+        overflow = f" and {len(counts) - 3} others" if len(counts) > 3 else ""
+        n = len(received)
+        parts.append(f"{n} email{'s' if n != 1 else ''} received from {sender_str}{overflow}.")
+        action_subjs = [e["subject"] for e in received if _ACTION_KEYWORDS.search(e.get("subject", ""))]
+        if action_subjs:
+            parts.append(f"Flagged for follow-up: {'; '.join(repr(s) for s in action_subjs[:3])}.")
+
+    if sent:
+        n = len(sent)
+        recipients = list({e["to"] for e in sent})[:3]
+        parts.append(f"{n} email{'s' if n != 1 else ''} sent to {', '.join(recipients)}.")
+
+    return " ".join(parts) or None
+
+
 def fetch_emails(since_hours: int = 24) -> dict:
     """
     Returns {"urgent": [...], "normal": [...], "deferred_count": int}
@@ -1413,10 +1474,21 @@ def build_evening_briefing(target_date: date) -> str:
     if email_data["deferred_count"]:
         lines.append(f"📥 {email_data['deferred_count']} work emails received — deferred (OOO/weekend)")
     elif not effective_weekend:
-        for e in email_data["urgent"]:
-            lines.append(_format_email_line(e, urgent=True) + " <i>(action required)</i>")
-        for e in email_data["normal"]:
-            lines.append(_format_email_line(e))
+        all_emails = email_data["urgent"] + email_data["normal"]
+        if all_emails:
+            received = [e for e in all_emails if not e.get("is_sent")]
+            sent_emails = [e for e in all_emails if e.get("is_sent")]
+            summary = summarise_emails(received, sent_emails)
+            if summary:
+                lines.append(summary)
+            else:
+                # Fallback: list individual emails if AI summary unavailable
+                for e in email_data["urgent"]:
+                    lines.append(_format_email_line(e, urgent=True) + " <i>(action required)</i>")
+                for e in email_data["normal"]:
+                    lines.append(_format_email_line(e))
+        else:
+            lines.append("No new emails.")
     if not email_data["urgent"] and not email_data["normal"] and not email_data["deferred_count"]:
         lines.append("No new emails.")
 
@@ -1500,10 +1572,18 @@ def build_morning_briefing() -> str:
     if effective_weekend and email_data.get("deferred_count"):
         lines.append(f"📥 {email_data['deferred_count']} work emails received — deferred (OOO/weekend)")
     elif not effective_weekend:
-        for e in email_data["urgent"]:
-            lines.append(_format_email_line(e, urgent=True) + " <i>(action required)</i>")
-        for e in email_data["normal"]:
-            lines.append(_format_email_line(e))
+        all_emails = email_data["urgent"] + email_data["normal"]
+        if all_emails:
+            received = [e for e in all_emails if not e.get("is_sent")]
+            sent_emails = [e for e in all_emails if e.get("is_sent")]
+            summary = summarise_emails(received, sent_emails)
+            if summary:
+                lines.append(summary)
+            else:
+                for e in email_data["urgent"]:
+                    lines.append(_format_email_line(e, urgent=True) + " <i>(action required)</i>")
+                for e in email_data["normal"]:
+                    lines.append(_format_email_line(e))
     if not email_data["urgent"] and not email_data["normal"] and not email_data.get("deferred_count"):
         lines.append("No overnight emails.")
 
