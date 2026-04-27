@@ -255,6 +255,148 @@ def mark_google_task_done_by_id(task_list_id: str, task_id: str, label: str) -> 
         return False
 
 
+def reschedule_google_task(task_list_id: str, task_id: str, label: str, new_date: date) -> bool:
+    """Patch the due date of a specific Google Task. label = 'Personal' | 'Work'."""
+    try:
+        creds = _build_personal_credentials() if label == "Personal" else _build_credentials()
+        if not creds:
+            log.error(f"[RESCHEDULE_GOOGLE_TASK] [{label}] [NO_CREDS]")
+            return False
+        service = build("tasks", "v1", credentials=creds)
+        due_str = new_date.strftime("%Y-%m-%dT00:00:00.000Z")
+        service.tasks().patch(
+            tasklist=task_list_id,
+            task=task_id,
+            body={"due": due_str},
+        ).execute()
+        log.info(f"[RESCHEDULE_GOOGLE_TASK] [{label}] [OK]")
+        return True
+    except Exception as exc:
+        log.error(f"[RESCHEDULE_GOOGLE_TASK] [{label}] [FAIL] [{type(exc).__name__}]")
+        return False
+
+
+def reschedule_local_task_by_title(title: str, new_date: date) -> bool:
+    """Update the due_date field of a local task by exact title match."""
+    tasks = load_tasks()
+    for t in tasks:
+        if t.get("title") == title and t.get("status") != "done":
+            t["due_date"] = new_date.isoformat()
+            save_tasks(tasks)
+            log.info("[RESCHEDULE_LOCAL_TASK] [OK]")
+            return True
+    return False
+
+
+def rename_task(old_title: str, new_title: str) -> Optional[str]:
+    """
+    Rename a task by fuzzy-matching old_title across local store and Google Tasks.
+    Personal tasks are synced to Google. Returns the matched original title, or None.
+    """
+    needle = old_title.lower().strip()
+    new_title = new_title[:200].strip()
+    if not new_title:
+        return None
+
+    # Search local first
+    tasks = load_tasks()
+    best = None
+    best_score = 0
+    for t in tasks:
+        title = t.get("title", "").lower()
+        score = len([w for w in needle.split() if w in title])
+        if score > best_score:
+            best_score = score
+            best = t
+
+    if best and best_score > 0:
+        old = best["title"]
+        is_personal = "personal" in best.get("type", "").lower()
+        best["title"] = new_title
+        save_tasks(tasks)
+        log.info("[RENAME_TASK] [LOCAL] [OK]")
+        if is_personal:
+            _rename_google_task_fuzzy(old, new_title, "Personal")
+        return old
+
+    # Not in local — try Google Tasks directly
+    return _rename_google_task_fuzzy(needle, new_title, None)
+
+
+def _rename_google_task_fuzzy(needle: str, new_title: str, label: Optional[str]) -> Optional[str]:
+    """Fuzzy-search Google Tasks across one or both accounts and rename the best match."""
+    best_title = None
+    best_score = 0
+    best_list_id = None
+    best_task_id = None
+    best_service = None
+    needle_lower = needle.lower()
+
+    def _search(service):
+        nonlocal best_title, best_score, best_list_id, best_task_id, best_service
+        try:
+            for tl in service.tasklists().list(maxResults=20).execute().get("items", []):
+                for task in service.tasks().list(
+                    tasklist=tl["id"], showCompleted=False, maxResults=100
+                ).execute().get("items", []):
+                    t = task.get("title", "").lower()
+                    score = len([w for w in needle_lower.split() if w in t])
+                    if score > best_score:
+                        best_score = score
+                        best_title = task.get("title")
+                        best_list_id = tl["id"]
+                        best_task_id = task["id"]
+                        best_service = service
+        except Exception:
+            pass
+
+    if label in (None, "Personal"):
+        personal_creds = _build_personal_credentials()
+        if personal_creds:
+            try:
+                _search(build("tasks", "v1", credentials=personal_creds))
+            except Exception:
+                pass
+
+    if label in (None, "Work"):
+        try:
+            _search(build("tasks", "v1", credentials=_build_credentials()))
+        except Exception:
+            pass
+
+    if best_score > 0 and best_task_id and best_service:
+        try:
+            best_service.tasks().patch(
+                tasklist=best_list_id,
+                task=best_task_id,
+                body={"title": new_title},
+            ).execute()
+            log.info("[RENAME_GOOGLE_TASK] [FUZZY] [OK]")
+            return best_title
+        except Exception as exc:
+            log.error(f"[RENAME_GOOGLE_TASK] [FUZZY] [FAIL] [{type(exc).__name__}]")
+    return None
+
+
+def rename_google_task_by_id(task_list_id: str, task_id: str, new_title: str, label: str) -> bool:
+    """Rename a specific Google Task by IDs. label = 'Personal' | 'Work'."""
+    try:
+        creds = _build_personal_credentials() if label == "Personal" else _build_credentials()
+        if not creds:
+            return False
+        service = build("tasks", "v1", credentials=creds)
+        service.tasks().patch(
+            tasklist=task_list_id,
+            task=task_id,
+            body={"title": new_title},
+        ).execute()
+        log.info(f"[RENAME_GOOGLE_TASK_BY_ID] [{label}] [OK]")
+        return True
+    except Exception as exc:
+        log.error(f"[RENAME_GOOGLE_TASK_BY_ID] [{label}] [FAIL] [{type(exc).__name__}]")
+        return False
+
+
 def _mark_google_task_done(needle: str) -> Optional[str]:
     """Search both accounts' Google Tasks and complete the best match."""
     best_title = None
