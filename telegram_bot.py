@@ -423,7 +423,12 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             # Always sync as a Google Task (recurring info stored locally only —
             # Google Tasks API does not support RRULE)
             ok = engine.add_personal_google_task(task_title, due_date=target_date)
-            sync_note = " ✅ Synced to Google Tasks" if ok else " ⚠️ Google sync failed"
+            if ok:
+                sync_note = " ✅ Synced to Google Tasks (first occurrence only)"
+                if rrule:
+                    sync_note += "\n⚠️ Google Tasks doesn't support recurring tasks — please set up the repeat manually in Google Tasks or Calendar."
+            else:
+                sync_note = " ⚠️ Google sync failed"
 
             await update.message.reply_text(
                 f"✅ Personal task added: {task_title}{date_note}{rec_note}\n{sync_note}"
