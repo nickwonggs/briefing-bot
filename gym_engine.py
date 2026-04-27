@@ -277,6 +277,61 @@ def delete_gym_event(target_date: date) -> bool:
         return False
 
 
+def cascade_skip(skipped_date: date) -> list[str]:
+    """
+    After skipping skipped_date, find all remaining gym events later this week,
+    delete them, and recreate them in order so their split labels stay correct.
+    Returns a list of human-readable result lines (one per rescheduled day).
+    """
+    today = date.today()
+    monday = today - timedelta(days=today.weekday())
+    sunday = monday + timedelta(days=6)
+
+    gym_cal_id = find_gym_calendar_id()
+    if gym_cal_id is None:
+        return []
+
+    try:
+        svc = _cal_service()
+        # Find gym events strictly after the skipped date, within this week
+        search_start = datetime.combine(skipped_date + timedelta(days=1), time(0, 0)).replace(tzinfo=TZ)
+        week_end = datetime.combine(sunday, time(23, 59)).replace(tzinfo=TZ)
+
+        if search_start > week_end:
+            return []
+
+        events = svc.events().list(
+            calendarId=gym_cal_id,
+            timeMin=search_start.isoformat(),
+            timeMax=week_end.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+        ).execute().get("items", [])
+
+        # Collect dates of existing gym events then delete them all first
+        dates_to_reschedule: list[date] = []
+        for ev in events:
+            if "🏋️ Gym" not in ev.get("summary", ""):
+                continue
+            start_raw = ev["start"].get("dateTime", "")
+            if not start_raw:
+                continue
+            start_dt = datetime.fromisoformat(start_raw).astimezone(TZ)
+            dates_to_reschedule.append(start_dt.date())
+            svc.events().delete(calendarId=gym_cal_id, eventId=ev["id"]).execute()
+
+        results = []
+        for d in dates_to_reschedule:
+            ok, msg = schedule_gym_session(d)
+            results.append(msg)
+
+        return results
+
+    except Exception as exc:
+        log.error(f"[GYM_ENGINE] [CASCADE_SKIP_FAIL] [{type(exc).__name__}] {exc}")
+        return []
+
+
 def get_week_sessions() -> list[dict]:
     """
     Return gym sessions scheduled for the current Mon–Sun week.

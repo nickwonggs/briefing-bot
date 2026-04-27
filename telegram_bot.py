@@ -668,12 +668,17 @@ async def cmd_gym_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         today = date.today()
         deleted = gym.delete_gym_event(today)
         next_split = gym.advance_split()
-        cal_note = " Calendar event removed." if deleted else ""
+        cal_note = " Today's event removed." if deleted else ""
         await update.message.reply_text(
             f"Got it — skipping today.{cal_note}\n"
-            f"Next session: {next_split} Day. 💪",
+            f"Next session: {next_split} Day. 💪\n\n"
+            f"Updating remaining sessions this week…",
             parse_mode=None,
         )
+        # Cascade: delete and recreate remaining gym events this week with corrected splits
+        cascaded = gym.cascade_skip(today)
+        if cascaded:
+            await update.message.reply_text("\n".join(cascaded), parse_mode=None)
         log.info("[CMD_GYM_SKIP] [OK]")
     except Exception:
         log.error("[CMD_GYM_SKIP] [FAIL]")
@@ -730,7 +735,9 @@ async def cmd_gym_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE)
         raw = update.message.text.partition(" ")[2].strip()
         if not raw:
             await update.message.reply_text(
-                "Usage: /reschedule 2026-05-05\nSupported formats: YYYY-MM-DD, 5 May, May 5",
+                "Usage: /reschedule [date] — schedules a gym session ON that date.\n"
+                "Example: /reschedule 2026-05-05\n"
+                "Formats: YYYY-MM-DD, 5 May, May 5",
                 parse_mode=None,
             )
             return
@@ -741,7 +748,7 @@ async def cmd_gym_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 parse_mode=None,
             )
             return
-        await update.message.reply_text(f"Finding a free slot on {target.strftime('%a %-d %b')}…")
+        await update.message.reply_text(f"Scheduling your gym session for {target.strftime('%a %-d %b')}…")
         gym.delete_gym_event(target)
         ok, msg = gym.schedule_gym_session(target)
         await update.message.reply_text(msg, parse_mode=None)
