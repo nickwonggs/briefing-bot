@@ -23,7 +23,10 @@ from googleapiclient.discovery import build
 
 load_dotenv()
 
-SCOPES = ["https://www.googleapis.com/auth/tasks"]
+SCOPES = [
+    "https://www.googleapis.com/auth/tasks",
+    "https://www.googleapis.com/auth/calendar",
+]
 ENV_FILE = ".env"
 CREDS_FILE = "credentials.json"
 TOKEN_FILE = "token_personal.json"

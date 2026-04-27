@@ -34,7 +34,10 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/tasks",
 ]
-PERSONAL_TASKS_SCOPES = ["https://www.googleapis.com/auth/tasks"]
+PERSONAL_TASKS_SCOPES = [
+    "https://www.googleapis.com/auth/tasks",
+    "https://www.googleapis.com/auth/calendar",
+]
 REQUIRED_ACCOUNT = "nickwys@sph.com.sg"
 _DATA_DIR = os.getenv("TASK_DATA_DIR", ".")
 TASK_FILE = os.path.join(_DATA_DIR, "task_state.json.enc")
@@ -88,6 +91,163 @@ PERSONAL_CALENDAR_KEYWORDS = ("gym", "personal", "ryan chia", "vacation", "other
 def _h(text) -> str:
     """HTML-escape user-supplied content for safe Telegram HTML parse mode."""
     return _html.escape(str(text))
+
+
+# ── Priority helpers ───────────────────────────────────────────────────────────
+
+_PRIORITY_EMOJI  = {"P0": "🔴", "P1": "🟠", "P2": "🟡", "P3": "🟢"}
+_PRIORITY_ORDER  = {"P0": 0,    "P1": 1,    "P2": 2,    "P3": 3}
+
+
+# ── Date / recurrence parsers ──────────────────────────────────────────────────
+
+_MONTH_MAP = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    "january": 1, "february": 2, "march": 3, "april": 4, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10,
+    "november": 11, "december": 12,
+}
+_DAY_MAP = {
+    "monday": 0, "mon": 0, "tuesday": 1, "tue": 1,
+    "wednesday": 2, "wed": 2, "thursday": 3, "thu": 3,
+    "friday": 4, "fri": 4, "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+}
+_RRULE_DAY_MAP = {
+    "monday": "MO", "mon": "MO", "tuesday": "TU", "tue": "TU",
+    "wednesday": "WE", "wed": "WE", "thursday": "TH", "thu": "TH",
+    "friday": "FR", "fri": "FR", "saturday": "SA", "sat": "SA",
+    "sunday": "SU", "sun": "SU",
+}
+
+
+def parse_task_date(text: str) -> Optional[date]:
+    """
+    Parse common natural-language date expressions into a date object (SGT-aware).
+    Supported: today, tomorrow/tmr, friday, next monday, in 3 days,
+               5 may, may 5, 1st jan, 2026-05-01, 5/5, 5/5/2026
+    """
+    if not text:
+        return None
+    t = text.lower().strip().rstrip(".,")
+    today = datetime.now(TZ).date()
+
+    if t in ("today",):
+        return today
+    if t in ("tomorrow", "tmr", "tom"):
+        return today + timedelta(days=1)
+    if t == "next week":
+        return today + timedelta(weeks=1)
+
+    # "in N days / weeks / months"
+    m = re.match(r"^in (\d+) (day|days|week|weeks|month|months)$", t)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        if "week" in unit:
+            return today + timedelta(weeks=n)
+        if "month" in unit:
+            return today + timedelta(days=n * 30)
+        return today + timedelta(days=n)
+
+    # Day name (strip optional "next"/"this" prefix)
+    day_text = t
+    for prefix in ("next ", "this "):
+        if t.startswith(prefix):
+            day_text = t[len(prefix):]
+    if day_text in _DAY_MAP:
+        target = _DAY_MAP[day_text]
+        ahead = (target - today.weekday()) % 7 or 7  # always future
+        return today + timedelta(days=ahead)
+
+    # "DD [month]" e.g. "5 may", "1st jan"
+    m = re.match(r"^(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)$", t)
+    if m:
+        month_idx = _MONTH_MAP.get(m.group(2)) or _MONTH_MAP.get(m.group(2)[:3])
+        if month_idx:
+            try:
+                d = date(today.year, month_idx, int(m.group(1)))
+                return d if d >= today else date(today.year + 1, month_idx, int(m.group(1)))
+            except ValueError:
+                pass
+
+    # "[month] DD" e.g. "may 5"
+    m = re.match(r"^([a-z]+)\s+(\d{1,2})$", t)
+    if m:
+        month_idx = _MONTH_MAP.get(m.group(1)) or _MONTH_MAP.get(m.group(1)[:3])
+        if month_idx:
+            try:
+                d = date(today.year, month_idx, int(m.group(2)))
+                return d if d >= today else date(today.year + 1, month_idx, int(m.group(2)))
+            except ValueError:
+                pass
+
+    # DD/MM or DD/MM/YYYY
+    m = re.match(r"^(\d{1,2})[/\-](\d{1,2})(?:[/\-](\d{2,4}))?$", t)
+    if m:
+        dy, mo = int(m.group(1)), int(m.group(2))
+        yr = int(m.group(3)) if m.group(3) else today.year
+        if yr < 100:
+            yr += 2000
+        try:
+            d = date(yr, mo, dy)
+            return d if d >= today else (date(yr + 1, mo, dy) if not m.group(3) else d)
+        except ValueError:
+            pass
+
+    # YYYY-MM-DD
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", t)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+
+    return None
+
+
+def parse_task_recurrence(text: str) -> tuple[Optional[str], str]:
+    """
+    Parse recurrence text into (RRULE, human_display).
+    Returns (None, original_text) if unrecognised.
+
+    Supported: daily, weekly, monthly, yearly, weekdays,
+               every N days/weeks/months, monday (→ weekly on that day)
+    """
+    if not text:
+        return None, ""
+    t = text.lower().strip()
+
+    simple = {
+        "daily": ("RRULE:FREQ=DAILY", "daily"),
+        "day":   ("RRULE:FREQ=DAILY", "daily"),
+        "weekly": ("RRULE:FREQ=WEEKLY", "weekly"),
+        "week":   ("RRULE:FREQ=WEEKLY", "weekly"),
+        "monthly": ("RRULE:FREQ=MONTHLY", "monthly"),
+        "month":   ("RRULE:FREQ=MONTHLY", "monthly"),
+        "yearly":  ("RRULE:FREQ=YEARLY", "yearly"),
+        "year":    ("RRULE:FREQ=YEARLY", "yearly"),
+        "annual":  ("RRULE:FREQ=YEARLY", "yearly"),
+        "annually":("RRULE:FREQ=YEARLY", "yearly"),
+        "weekdays":("RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR", "weekdays"),
+        "weekday": ("RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR", "weekdays"),
+    }
+    if t in simple:
+        return simple[t]
+
+    # "N days / weeks / months"
+    m = re.match(r"^(\d+) (days?|weeks?|months?)$", t)
+    if m:
+        n, unit = m.group(1), m.group(2).rstrip("s")
+        freq = {"day": "DAILY", "week": "WEEKLY", "month": "MONTHLY"}[unit]
+        return f"RRULE:FREQ={freq};INTERVAL={n}", f"every {n} {unit}s"
+
+    # Day name → weekly on that day
+    if t in _RRULE_DAY_MAP:
+        byday = _RRULE_DAY_MAP[t]
+        return f"RRULE:FREQ=WEEKLY;BYDAY={byday}", f"every {t}"
+
+    return None, text  # unrecognised — pass through as display string
 
 
 # ── Credential helpers ─────────────────────────────────────────────────────────
@@ -450,7 +610,14 @@ def _mark_google_task_done(needle: str) -> Optional[str]:
 
 
 def add_task(title: str, source: str = "Manual", task_type: str = "👤 Personal",
-             due_date: Optional[str] = None) -> None:
+             due_date: Optional[str] = None, priority: Optional[str] = None,
+             recurrence: Optional[str] = None) -> None:
+    """
+    Add a task to local encrypted store.
+    priority: 'P0'–'P3' (work tasks only; None for personal)
+    recurrence: human-readable string e.g. 'weekly', 'every 2 weeks' (display only)
+    due_date: ISO date string 'YYYY-MM-DD'
+    """
     tasks = load_tasks()
     tasks.append({
         "title": title[:200],
@@ -458,35 +625,64 @@ def add_task(title: str, source: str = "Manual", task_type: str = "👤 Personal
         "source": source,
         "type": task_type,
         "due_date": due_date,
+        "priority": priority,
+        "recurrence": recurrence,
         "created_at": datetime.now(TZ).isoformat(),
     })
     save_tasks(tasks)
 
 
-def add_personal_google_task(title: str) -> bool:
+def add_personal_google_task(title: str, due_date: Optional[date] = None) -> bool:
     """
-    Add a task to the personal Google Tasks account (wongnicholas98@gmail.com).
-    Due date is set to today (SGT) so the task appears on the Google Calendar grid.
-    Returns True on success.
+    Add a task to personal Google Tasks (wongnicholas98@gmail.com).
+    due_date defaults to today (SGT). Task appears on the Google Calendar grid.
     """
     creds = _build_personal_credentials()
     if not creds:
-        log.error("[ADD_PERSONAL_GOOGLE_TASK] [NO_CREDS] — GOOGLE_TOKEN_JSON_PERSONAL not set or invalid")
+        log.error("[ADD_PERSONAL_GOOGLE_TASK] [NO_CREDS]")
         return False
     try:
         service = build("tasks", "v1", credentials=creds)
-        # RFC 3339 due date — Google Tasks ignores the time portion; only the date is used.
-        # Setting this makes the task appear on the Google Calendar grid for today.
-        today_due = datetime.now(TZ).strftime("%Y-%m-%dT00:00:00.000Z")
-        # "@default" always resolves to the user's primary task list — no extra API call needed
+        d = due_date or datetime.now(TZ).date()
+        due_str = d.strftime("%Y-%m-%dT00:00:00.000Z")
         service.tasks().insert(
             tasklist="@default",
-            body={"title": title[:200], "due": today_due},
+            body={"title": title[:200], "due": due_str},
         ).execute()
         log.info("[ADD_PERSONAL_GOOGLE_TASK] [OK]")
         return True
     except Exception as exc:
         log.error(f"[ADD_PERSONAL_GOOGLE_TASK] [FAIL] [{type(exc).__name__}]")
+        return False
+
+
+def add_personal_google_calendar_event(title: str, event_date: date,
+                                        rrule: Optional[str] = None) -> bool:
+    """
+    Create an all-day event on the personal Google Calendar (wongnicholas98@gmail.com).
+    If rrule is provided (e.g. 'RRULE:FREQ=WEEKLY'), the event repeats.
+    Requires Calendar scope on the personal token — re-run auth_personal_tasks.py
+    if this returns False with a 403 error.
+    """
+    creds = _build_personal_credentials()
+    if not creds:
+        log.error("[ADD_PERSONAL_CAL_EVENT] [NO_CREDS]")
+        return False
+    try:
+        service = build("calendar", "v3", credentials=creds)
+        body: dict = {
+            "summary": title[:200],
+            "start": {"date": event_date.isoformat()},
+            # Google Calendar all-day events: end is exclusive (day after)
+            "end":   {"date": (event_date + timedelta(days=1)).isoformat()},
+        }
+        if rrule:
+            body["recurrence"] = [rrule]
+        service.events().insert(calendarId="primary", body=body).execute()
+        log.info("[ADD_PERSONAL_CAL_EVENT] [OK]")
+        return True
+    except Exception as exc:
+        log.error(f"[ADD_PERSONAL_CAL_EVENT] [FAIL] [{type(exc).__name__}]")
         return False
 
 
@@ -929,13 +1125,26 @@ def _format_task_list(tasks: list[dict], google_tasks: list[dict] = None,
     gt_personal = [t for t in google_tasks if t.get("label") == "Personal" and _is_due_today_or_overdue(t)]
     gt_work = [t for t in google_tasks if t.get("label") == "Work" and _is_due_today_or_overdue(t)]
 
+    def _task_due_rec(t: dict) -> str:
+        """Return ' (due DD Mon, recurring)' annotation for a local task."""
+        parts = []
+        if t.get("due_date"):
+            try:
+                d = date.fromisoformat(t["due_date"])
+                parts.append(f"due {d.strftime('%d %b')}")
+            except ValueError:
+                pass
+        if t.get("recurrence"):
+            parts.append(f"🔁 {t['recurrence']}")
+        return f" ({', '.join(parts)})" if parts else ""
+
     lines = ["👤 <b>Personal Tasks</b>"]
     if local_personal_done:
         lines.append("🟢 Completed: " + ", ".join(_h(t["title"]) for t in local_personal_done))
     if local_personal_overdue:
         lines.append("🔴 Overdue: " + ", ".join(_h(t["title"]) for t in local_personal_overdue))
     for t in local_personal_active:
-        lines.append(f"• {_h(t['title'])}")
+        lines.append(f"• {_h(t['title'])}{_task_due_rec(t)}")
     for t in gt_personal:
         due = f" (due {_h(t['due'])})" if t.get("due") else ""
         emoji = "🔴" if t.get("overdue") else "🟡"
@@ -946,15 +1155,24 @@ def _format_task_list(tasks: list[dict], google_tasks: list[dict] = None,
 
     if not weekend:
         lines += ["", "💼 <b>Work Tasks</b>"]
-        if local_work_overdue:
-            lines.append("🔴 Overdue: " + ", ".join(_h(t["title"]) for t in local_work_overdue))
-        for t in local_work_active:
-            lines.append(f"• {_h(t['title'])}")
+        # Combine local work tasks and sort by priority (P0 first), overdue first within each
+        work_items = sorted(
+            local_work_overdue + local_work_active,
+            key=lambda t: (
+                _PRIORITY_ORDER.get(t.get("priority", "P2"), 2),
+                0 if t.get("status") == "overdue" else 1,
+            ),
+        )
+        for t in work_items:
+            p = t.get("priority", "P2")
+            badge = _PRIORITY_EMOJI.get(p, "🟡")
+            overdue_tag = " ⚠️" if t.get("status") == "overdue" else ""
+            lines.append(f"{badge} <b>{p}</b> {_h(t['title'])}{_task_due_rec(t)}{overdue_tag}")
         for t in gt_work:
             due = f" (due {_h(t['due'])})" if t.get("due") else ""
             emoji = "🔴" if t.get("overdue") else "🟡"
             lines.append(f"{emoji} {_h(t['title'])}{due}")
-        if not local_work_overdue and not local_work_active and not gt_work:
+        if not work_items and not gt_work:
             lines.append("No work tasks.")
 
     return "\n".join(lines)
@@ -977,20 +1195,26 @@ def _top_priorities_split(tasks: list[dict], google_tasks: list[dict],
                       and t.get("status") in ("overdue", "in_progress")
                       and not t.get("auto_generated")]
 
-    def _pick3(candidates):
-        seen = set()
+    def _pick3(candidates, show_priority: bool = False):
+        seen: set[str] = set()
         unique = []
         for c in candidates:
-            t = c["title"]
-            if t not in seen:
-                seen.add(t)
+            title = c["title"]
+            if title not in seen:
+                seen.add(title)
                 unique.append(c)
             if len(unique) == 3:
                 break
-        lines = [f"{i+1}. {_h(p['title'])}" for i, p in enumerate(unique)]
-        while len(lines) < 3:
-            lines.append(f"{len(lines)+1}. (Add manually)")
-        return lines
+        result = []
+        for i, p in enumerate(unique):
+            if show_priority and p.get("priority"):
+                badge = f"{_PRIORITY_EMOJI.get(p['priority'], '')} <b>{p['priority']}</b> "
+            else:
+                badge = ""
+            result.append(f"{i+1}. {badge}{_h(p['title'])}")
+        while len(result) < 3:
+            result.append(f"{len(result)+1}. (Add manually)")
+        return result
 
     personal_combined = (
         [t for t in personal_gt if t.get("overdue")] +
@@ -1002,14 +1226,21 @@ def _top_priorities_split(tasks: list[dict], google_tasks: list[dict],
     lines = []
 
     if not weekend:
-        work_combined = (
-            [t for t in work_gt if t.get("overdue")] +
-            [t for t in work_local if t.get("status") == "overdue"] +
-            work_gt +
-            work_local
+        # Sort work by priority first, then overdue status
+        work_combined = sorted(
+            (
+                [t for t in work_gt if t.get("overdue")] +
+                [t for t in work_local if t.get("status") == "overdue"] +
+                work_gt +
+                work_local
+            ),
+            key=lambda t: (
+                _PRIORITY_ORDER.get(t.get("priority", "P2"), 2),
+                0 if t.get("status") == "overdue" else 1,
+            ),
         )
         lines += ["💼 <b>Work</b>"]
-        lines.extend(_pick3(work_combined))
+        lines.extend(_pick3(work_combined, show_priority=True))
         lines += [""]
 
     lines += ["👤 <b>Personal</b>"]

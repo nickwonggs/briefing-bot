@@ -164,7 +164,9 @@ def _build_done_keyboard(chat_id: int) -> Optional[InlineKeyboardMarkup]:
     if work:
         buttons.append([InlineKeyboardButton("── Work Tasks ──", callback_data="noop")])
         for i, t in enumerate(work[:10]):
-            label = t["title"][:40] + ("…" if len(t["title"]) > 40 else "")
+            p = t.get("priority", "P2")
+            prefix = f"[{p}] " if t["source"] == "local" else ""
+            label = (prefix + t["title"])[:42] + ("…" if len(prefix + t["title"]) > 42 else "")
             buttons.append([InlineKeyboardButton(f"✅ {label}", callback_data=f"dw:{i}")])
     buttons.append([InlineKeyboardButton("Cancel", callback_data="noop")])
     return InlineKeyboardMarkup(buttons)
@@ -203,7 +205,10 @@ def _build_update_keyboard(chat_id: int) -> Optional[InlineKeyboardMarkup]:
     if work:
         buttons.append([InlineKeyboardButton("── Work Tasks ──", callback_data="noop")])
         for i, t in enumerate(work[:10]):
-            name = t["title"][:46] + ("…" if len(t["title"]) > 46 else "")
+            p = t.get("priority", "P2")
+            prefix = f"[{p}] " if t["source"] == "local" else ""
+            raw_name = prefix + t["title"]
+            name = raw_name[:46] + ("…" if len(raw_name) > 46 else "")
             buttons.append([InlineKeyboardButton(name, callback_data="noop")])
             buttons.append([
                 InlineKeyboardButton("✅ Done",      callback_data=f"ua:w:{i}:done"),
@@ -306,40 +311,135 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(GENERIC_ERROR)
 
 
+def _parse_add_args(raw: str) -> dict:
+    """
+    Parse /add command arguments into structured fields.
+    Extraction order (right-to-left to avoid greedy matching on title):
+      1. Work prefix  "w "
+      2. Priority     "p0"–"p3" anywhere
+      3. Recurrence   "every [freq]" at the end
+      4. Date         "on [date]"  at the end (before "every")
+      5. Remainder    = task title
+
+    Returns: {is_work, title, due_date, rrule, recurrence_display, priority}
+    """
+    is_work = False
+    if raw.lower().startswith("w ") and len(raw) > 2:
+        is_work = True
+        raw = raw[2:].strip()
+
+    # Priority: p0-p3 anywhere (case-insensitive)
+    priority = "P2"
+    p_m = re.search(r"\bp([0-3])\b", raw, re.IGNORECASE)
+    if p_m:
+        priority = f"P{p_m.group(1)}"
+        raw = (raw[:p_m.start()] + raw[p_m.end():]).strip()
+        raw = re.sub(r"\s{2,}", " ", raw)
+
+    # Recurrence: "every [freq]" at the end
+    rrule, recurrence_display = None, None
+    every_m = re.search(r"\s+every\s+(.+)$", raw, re.IGNORECASE)
+    if every_m:
+        rrule, recurrence_display = engine.parse_task_recurrence(every_m.group(1).strip())
+        raw = raw[:every_m.start()].strip()
+
+    # Date: "on [date]" at the end
+    due_date = None
+    on_m = re.search(r"\s+on\s+(.+)$", raw, re.IGNORECASE)
+    if on_m:
+        due_date = engine.parse_task_date(on_m.group(1).strip())
+        raw = raw[:on_m.start()].strip()
+
+    return {
+        "is_work": is_work,
+        "title": raw.strip(),
+        "due_date": due_date,
+        "rrule": rrule,
+        "recurrence_display": recurrence_display,
+        "priority": priority,
+    }
+
+
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update):
         return
     log.info("[CMD_ADD] [START]")
     try:
-        args = update.message.text.partition(" ")[2].strip()
-        if not args:
+        raw = update.message.text.partition(" ")[2].strip()
+        if not raw:
             await update.message.reply_text(
-                "Usage:\n"
-                "  /add [task] — personal task (synced to Google Tasks + Calendar)\n"
-                "  /add w [task] — work task (local only)"
+                "Usage:\n\n"
+                "Personal tasks (synced to Google):\n"
+                "  /add [task]\n"
+                "  /add [task] on [date]\n"
+                "  /add [task] on [date] every [freq]\n\n"
+                "Work tasks (local, with priority P0–P3):\n"
+                "  /add w [task]\n"
+                "  /add w [task] p1\n"
+                "  /add w [task] p0 on [date]\n\n"
+                "Date: tomorrow, friday, 5 may, next week, 2026-05-01\n"
+                "Freq: daily, weekly, monthly, every 2 weeks, weekdays"
             )
             return
 
-        is_work = False
-        if args.lower().startswith("w ") and len(args) > 2:
-            is_work = True
-            args = args[2:].strip()
-
-        task_title = _sanitise(args, MAX_ADD_LEN)
+        parsed = _parse_add_args(_sanitise(raw, MAX_ADD_LEN + 100))
+        task_title = _sanitise(parsed["title"], MAX_ADD_LEN)
         if not task_title:
-            await update.message.reply_text("Task description cannot be empty.")
+            await update.message.reply_text("Task title cannot be empty.")
             return
 
-        if is_work:
-            engine.add_task(task_title, source="Manual", task_type="💼 Work")
-            await update.message.reply_text(f"✅ Work task added: {task_title}")
-            log.info("[CMD_ADD] [WORK] [OK]")
+        due_date: Optional[date] = parsed["due_date"]
+        rrule: Optional[str] = parsed["rrule"]
+        rec_display: Optional[str] = parsed["recurrence_display"]
+
+        if parsed["is_work"]:
+            # Work task — local only, with priority
+            due_str = due_date.isoformat() if due_date else None
+            engine.add_task(
+                task_title, source="Manual", task_type="💼 Work",
+                due_date=due_str, priority=parsed["priority"],
+                recurrence=rec_display,
+            )
+            p = parsed["priority"]
+            date_note = f", due {due_date.strftime('%d %b')}" if due_date else ""
+            rec_note  = f", repeats {rec_display}" if rec_display else ""
+            await update.message.reply_text(
+                f"✅ Work task added [{p}]: {task_title}{date_note}{rec_note}"
+            )
+            log.info(f"[CMD_ADD] [WORK] [{p}] [OK]")
+
         else:
-            engine.add_task(task_title, source="Manual", task_type="👤 Personal")
-            synced = engine.add_personal_google_task(task_title)
-            sync_note = " (synced to Google Tasks)" if synced else " (local only — Google sync failed)"
-            await update.message.reply_text(f"✅ Personal task added: {task_title}{sync_note}")
-            log.info(f"[CMD_ADD] [PERSONAL] [GOOGLE_SYNC={'OK' if synced else 'FAIL'}]")
+            # Personal task — store locally and sync to Google
+            due_str = due_date.isoformat() if due_date else None
+            engine.add_task(
+                task_title, source="Manual", task_type="👤 Personal",
+                due_date=due_str, recurrence=rec_display,
+            )
+
+            target_date = due_date or date.today()
+            date_note = f", due {target_date.strftime('%d %b')}" if due_date else " (today)"
+            rec_note  = f", repeats {rec_display}" if rec_display else ""
+
+            if rrule:
+                # Recurring → Google Calendar Event
+                ok = engine.add_personal_google_calendar_event(task_title, target_date, rrule)
+                if ok:
+                    sync_note = " 📅 Added to Google Calendar"
+                else:
+                    sync_note = (
+                        " ⚠️ Calendar sync failed — re-run auth_personal_tasks.py "
+                        "with Calendar scope and update GOOGLE_TOKEN_JSON_PERSONAL in Railway"
+                    )
+            else:
+                # Non-recurring → Google Task (appears as task strip in Calendar)
+                ok = engine.add_personal_google_task(task_title, due_date=target_date)
+                sync_note = " ✅ Synced to Google Tasks" if ok else " ⚠️ Google sync failed"
+
+            await update.message.reply_text(
+                f"✅ Personal task added: {task_title}{date_note}{rec_note}\n{sync_note}"
+            )
+            log.info(f"[CMD_ADD] [PERSONAL] [RECURRING={bool(rrule)}] [OK]")
+
     except Exception:
         log.error("[CMD_ADD] [FAIL]")
         await update.message.reply_text(GENERIC_ERROR)
@@ -444,13 +544,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/morning — Morning refresh\n"
         "/evening — Evening prep\n"
         "/tasks — Full task list\n"
-        "/done — Mark task done (dropdown)\n"
-        "/add [task] — Add personal task (synced to Google)\n"
-        "/add w [task] — Add work task (local only)\n\n"
-        "/update — Update tasks via dropdown:\n"
-        "   ✅ Done | 📅 Reschedule to today | 📅 +1 day\n"
-        "/update old name > new name — Rename a task\n"
-        "/update done [task] — Quick mark done\n\n"
+        "/done — Mark task done (dropdown)\n\n"
+        "Adding tasks:\n"
+        "  /add [task] — personal, today\n"
+        "  /add [task] on [date] — personal, specific date\n"
+        "  /add [task] on [date] every [freq] — personal, recurring\n"
+        "  /add w [task] p[0-3] — work task with priority\n"
+        "  /add w [task] p1 on [date] — work + priority + date\n"
+        "  Dates: tomorrow, friday, 5 may, next week\n"
+        "  Freq: daily, weekly, monthly, every 2 weeks\n\n"
+        "Updating tasks:\n"
+        "  /update — dropdown: ✅ Done | 📅 Today | 📅 +1 day\n"
+        "  /update old > new — rename a task\n"
+        "  /update done [task] — quick mark done\n\n"
         "/weekend — Personal schedule only\n"
         "/help — This message",
         parse_mode=None,
