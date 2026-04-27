@@ -773,11 +773,17 @@ def get_tasks_for_dropdown() -> dict:
     """
     Return structured task data for the /done inline keyboard dropdown.
     Result: {"personal": [...], "work": [...]}
-    Each entry: {title, source ("local"|"google"), task_id|None, task_list_id|None, label}
+    Each entry: {title, source ("local"|"google"), task_id|None, task_list_id|None, label, priority}
+
+    Personal tasks are deduplicated: if a local task's title matches a Google Task,
+    the Google version is preferred (so done/reschedule actions use the correct task ID).
     """
     tasks = load_tasks()
     tasks = _archive_old_done_tasks(tasks)
     google_tasks = fetch_google_tasks()
+
+    # Build set of all Google personal task titles for deduplication
+    google_personal_titles = {t["title"] for t in google_tasks if t.get("label") == "Personal"}
 
     personal = []
     work = []
@@ -788,12 +794,19 @@ def get_tasks_for_dropdown() -> dict:
         if t.get("auto_generated"):
             continue
         typ = t.get("type", "").lower()
-        entry = {"title": t["title"], "source": "local", "task_id": None, "task_list_id": None, "label": "Personal"}
         if "personal" in typ:
-            personal.append(entry)
+            # Skip local copy if an identical Google Task exists — Google version added below
+            if t["title"] not in google_personal_titles:
+                personal.append({
+                    "title": t["title"], "source": "local",
+                    "task_id": None, "task_list_id": None, "label": "Personal",
+                })
         elif "work" in typ:
-            entry["label"] = "Work"
-            work.append(entry)
+            work.append({
+                "title": t["title"], "source": "local",
+                "task_id": None, "task_list_id": None, "label": "Work",
+                "priority": t.get("priority", "P2"),
+            })
 
     for t in google_tasks:
         if not _is_due_today_or_overdue(t):
@@ -1138,13 +1151,17 @@ def _format_task_list(tasks: list[dict], google_tasks: list[dict] = None,
             parts.append(f"🔁 {t['recurrence']}")
         return f" ({', '.join(parts)})" if parts else ""
 
+    # Deduplicate: skip local personal tasks whose title already appears in Google Tasks
+    all_google_personal_titles = {t["title"] for t in google_tasks if t.get("label") == "Personal"}
+
     lines = ["👤 <b>Personal Tasks</b>"]
     if local_personal_done:
         lines.append("🟢 Completed: " + ", ".join(_h(t["title"]) for t in local_personal_done))
     if local_personal_overdue:
         lines.append("🔴 Overdue: " + ", ".join(_h(t["title"]) for t in local_personal_overdue))
     for t in local_personal_active:
-        lines.append(f"• {_h(t['title'])}{_task_due_rec(t)}")
+        if t["title"] not in all_google_personal_titles:
+            lines.append(f"• {_h(t['title'])}{_task_due_rec(t)}")
     for t in gt_personal:
         due = f" (due {_h(t['due'])})" if t.get("due") else ""
         emoji = "🔴" if t.get("overdue") else "🟡"
@@ -1287,13 +1304,17 @@ def build_evening_briefing(target_date: date) -> str:
     tasks = _archive_old_done_tasks(tasks)
     google_tasks = fetch_google_tasks()
 
+    existing_titles = {t["title"] for t in tasks}
     if email_data["urgent"]:
-        new_auto = extract_auto_tasks(email_data["urgent"])
+        new_auto = [t for t in extract_auto_tasks(email_data["urgent"])
+                    if t["title"] not in existing_titles]
         if new_auto:
             tasks.extend(new_auto)
+            existing_titles.update(t["title"] for t in new_auto)
             save_tasks(tasks)
 
-    event_tasks = extract_tasks_from_events(events)
+    event_tasks = [t for t in extract_tasks_from_events(events)
+                   if t["title"] not in existing_titles]
     if event_tasks:
         tasks.extend(event_tasks)
         save_tasks(tasks)
@@ -1372,13 +1393,17 @@ def build_morning_briefing() -> str:
     tasks = _archive_old_done_tasks(tasks)
     google_tasks = fetch_google_tasks()
 
+    existing_titles = {t["title"] for t in tasks}
     if email_data["urgent"]:
-        new_auto = extract_auto_tasks(email_data["urgent"])
+        new_auto = [t for t in extract_auto_tasks(email_data["urgent"])
+                    if t["title"] not in existing_titles]
         if new_auto:
             tasks.extend(new_auto)
+            existing_titles.update(t["title"] for t in new_auto)
             save_tasks(tasks)
 
-    event_tasks = extract_tasks_from_events(events)
+    event_tasks = [t for t in extract_tasks_from_events(events)
+                   if t["title"] not in existing_titles]
     if event_tasks:
         tasks.extend(event_tasks)
         save_tasks(tasks)
