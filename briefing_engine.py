@@ -921,7 +921,7 @@ def summarise_emails(received: list[dict], sent: list[dict]) -> Optional[str]:
             response = model.generate_content(prompt)
             return response.text.strip()
         except Exception as exc:
-            log.error(f"[EMAIL_SUMMARY] [GEMINI_FAIL] [{type(exc).__name__}] — falling back to rule-based")
+            log.error(f"[EMAIL_SUMMARY] [GEMINI_FAIL] [{type(exc).__name__}] {exc} — falling back to rule-based")
 
     # ── Rule-based fallback (no API key or Gemini call failed) ────────────────
     parts: list[str] = []
