@@ -34,6 +34,7 @@ from telegram.ext import (
     filters,
 )
 import briefing_engine as engine
+import gym_engine as gym
 
 load_dotenv()
 
@@ -228,7 +229,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("[CMD_START] [OK]")
     await update.message.reply_text(
         "👋 Daily Briefing Bot is online.\n\n"
-        "Commands:\n"
+        "Briefing:\n"
         "/morning — Morning refresh\n"
         "/evening — Evening prep\n"
         "/tasks — Current task list\n"
@@ -236,7 +237,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/add [task] — Add personal task (synced to Google)\n"
         "/add w [task] — Add work task (local only)\n"
         "/update — Update tasks: reschedule or rename\n"
-        "/weekend — Personal schedule only\n"
+        "/weekend — Personal schedule only\n\n"
+        "Gym:\n"
+        "/days MON WED FRI — Schedule gym days next week\n"
+        "/skip — Skip today, roll split forward\n"
+        "/status — This week's gym sessions\n"
+        "/next — Next split day (no change)\n"
+        "/reschedule [date] — Reschedule a day\n\n"
         "/help — Full command list",
         parse_mode=None,
     )
@@ -586,10 +593,216 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /update old > new — rename a task\n"
         "  /update [task] p0 — change priority (p0–p3)\n"
         "  /update done [task] — quick mark done\n\n"
-        "/weekend — Personal schedule only\n"
+        "/weekend — Personal schedule only\n\n"
+        "Gym:\n"
+        "  /days MON WED FRI — Schedule gym for those days next week\n"
+        "  /skip — Skip today, delete event, roll split forward\n"
+        "  /status — This week's scheduled gym sessions\n"
+        "  /next — Show next split day without changing state\n"
+        "  /reschedule [date] — Reschedule a day (e.g. /reschedule 2026-05-05)\n\n"
         "/help — This message",
         parse_mode=None,
     )
+
+
+_DAY_ABBREVS = {
+    "MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4, "SAT": 5, "SUN": 6,
+    "MONDAY": 0, "TUESDAY": 1, "WEDNESDAY": 2, "THURSDAY": 3,
+    "FRIDAY": 4, "SATURDAY": 5, "SUNDAY": 6,
+}
+
+_MONTH_NAMES = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    "january": 1, "february": 2, "march": 3, "april": 4, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+}
+
+
+def _parse_gym_date(text: str) -> Optional[date]:
+    """
+    Parse a user-supplied date string into a date.
+    Supports: YYYY-MM-DD, D Mon, D Month, Mon D.
+    Returns None if unparseable.
+    """
+    t = text.strip().lower()
+    today = date.today()
+
+    if t in ("today",):
+        return today
+    if t in ("tomorrow",):
+        return today + timedelta(days=1)
+
+    # YYYY-MM-DD
+    try:
+        return date.fromisoformat(t)
+    except ValueError:
+        pass
+
+    # "5 may" or "5may" or "may 5"
+    import re as _re
+    m = _re.match(r"^(\d{1,2})\s*([a-z]+)$", t) or _re.match(r"^([a-z]+)\s*(\d{1,2})$", t)
+    if m:
+        parts = m.groups()
+        try:
+            day_part = int(parts[0]) if parts[0].isdigit() else int(parts[1])
+            mon_part = parts[1] if parts[0].isdigit() else parts[0]
+            month_num = _MONTH_NAMES.get(mon_part[:3])
+            if month_num:
+                yr = today.year
+                d = date(yr, month_num, day_part)
+                if d < today:
+                    d = date(yr + 1, month_num, day_part)
+                return d
+        except (ValueError, TypeError):
+            pass
+
+    return None
+
+
+async def cmd_gym_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update):
+        return
+    log.info("[CMD_GYM_SKIP] [START]")
+    try:
+        today = date.today()
+        deleted = gym.delete_gym_event(today)
+        next_split = gym.advance_split()
+        cal_note = " Calendar event removed." if deleted else ""
+        await update.message.reply_text(
+            f"Got it — skipping today.{cal_note}\n"
+            f"Next session: {next_split} Day. 💪",
+            parse_mode=None,
+        )
+        log.info("[CMD_GYM_SKIP] [OK]")
+    except Exception:
+        log.error("[CMD_GYM_SKIP] [FAIL]")
+        await update.message.reply_text(GENERIC_ERROR)
+
+
+async def cmd_gym_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update):
+        return
+    log.info("[CMD_GYM_STATUS] [START]")
+    try:
+        sessions = gym.get_week_sessions()
+        current = gym.current_split_name()
+        if not sessions:
+            await update.message.reply_text(
+                f"No gym sessions scheduled this week.\n"
+                f"Current split position: {current} Day.\n"
+                f"Use /days to schedule.",
+                parse_mode=None,
+            )
+            return
+        lines = [f"🏋️ This week's gym sessions:\n"]
+        for s in sessions:
+            lines.append(f"  {s['weekday']} {s['date'].strftime('%-d %b')}: {s['time_str']} — {s['split']} Day")
+        lines.append(f"\nCurrent split: {current} Day")
+        await update.message.reply_text("\n".join(lines), parse_mode=None)
+        log.info("[CMD_GYM_STATUS] [OK]")
+    except Exception:
+        log.error("[CMD_GYM_STATUS] [FAIL]")
+        await update.message.reply_text(GENERIC_ERROR)
+
+
+async def cmd_gym_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update):
+        return
+    log.info("[CMD_GYM_NEXT] [OK]")
+    try:
+        current = gym.current_split_name()
+        nxt = gym.next_split_name()
+        await update.message.reply_text(
+            f"Current: {current} Day\nNext up: {nxt} Day",
+            parse_mode=None,
+        )
+    except Exception:
+        log.error("[CMD_GYM_NEXT] [FAIL]")
+        await update.message.reply_text(GENERIC_ERROR)
+
+
+async def cmd_gym_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update):
+        return
+    log.info("[CMD_GYM_RESCHEDULE] [START]")
+    try:
+        raw = update.message.text.partition(" ")[2].strip()
+        if not raw:
+            await update.message.reply_text(
+                "Usage: /reschedule 2026-05-05\nSupported formats: YYYY-MM-DD, 5 May, May 5",
+                parse_mode=None,
+            )
+            return
+        target = _parse_gym_date(_sanitise(raw))
+        if target is None:
+            await update.message.reply_text(
+                f"Couldn't parse date '{raw}'. Try: /reschedule 2026-05-05",
+                parse_mode=None,
+            )
+            return
+        await update.message.reply_text(f"Finding a free slot on {target.strftime('%a %-d %b')}…")
+        gym.delete_gym_event(target)
+        ok, msg = gym.schedule_gym_session(target)
+        await update.message.reply_text(msg, parse_mode=None)
+        log.info(f"[CMD_GYM_RESCHEDULE] [{'OK' if ok else 'FAIL'}]")
+    except Exception:
+        log.error("[CMD_GYM_RESCHEDULE] [FAIL]")
+        await update.message.reply_text(GENERIC_ERROR)
+
+
+async def cmd_gym_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update):
+        return
+    log.info("[CMD_GYM_DAYS] [START]")
+    try:
+        raw = update.message.text.partition(" ")[2].strip().upper()
+        if not raw:
+            await update.message.reply_text(
+                "Usage: /days MON WED FRI\nOptions: MON TUE WED THU FRI SAT SUN",
+                parse_mode=None,
+            )
+            return
+
+        tokens = raw.split()
+        weekday_nums = []
+        unknown = []
+        for tok in tokens:
+            if tok in _DAY_ABBREVS:
+                wd = _DAY_ABBREVS[tok]
+                if wd not in weekday_nums:
+                    weekday_nums.append(wd)
+            else:
+                unknown.append(tok)
+
+        if unknown:
+            await update.message.reply_text(
+                f"Unrecognised days: {', '.join(unknown)}. Use MON TUE WED THU FRI SAT SUN.",
+                parse_mode=None,
+            )
+            return
+        if not weekday_nums:
+            await update.message.reply_text("No valid days found.", parse_mode=None)
+            return
+
+        weekday_nums.sort()
+
+        today = date.today()
+        # Next Monday (always schedule for NEXT week, not current week)
+        days_to_monday = (7 - today.weekday()) % 7 or 7
+        next_monday = today + timedelta(days=days_to_monday)
+
+        results = []
+        for wd in weekday_nums:
+            target = next_monday + timedelta(days=wd)
+            ok, msg = gym.schedule_gym_session(target)
+            results.append(msg)
+
+        await update.message.reply_text("\n".join(results), parse_mode=None)
+        log.info(f"[CMD_GYM_DAYS] [OK] [{len(weekday_nums)}_DAYS]")
+    except Exception:
+        log.error("[CMD_GYM_DAYS] [FAIL]")
+        await update.message.reply_text(GENERIC_ERROR)
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -752,8 +965,15 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("done",    cmd_done))
     app.add_handler(CommandHandler("add",     cmd_add))
     app.add_handler(CommandHandler("update",  cmd_update))
-    app.add_handler(CommandHandler("weekend", cmd_weekend))
-    app.add_handler(CommandHandler("help",    cmd_help))
+    app.add_handler(CommandHandler("weekend",    cmd_weekend))
+    app.add_handler(CommandHandler("help",       cmd_help))
+
+    # Gym scheduler commands
+    app.add_handler(CommandHandler("skip",       cmd_gym_skip))
+    app.add_handler(CommandHandler("status",     cmd_gym_status))
+    app.add_handler(CommandHandler("next",       cmd_gym_next))
+    app.add_handler(CommandHandler("reschedule", cmd_gym_reschedule))
+    app.add_handler(CommandHandler("days",       cmd_gym_days))
 
     # Inline keyboard callbacks — matched by prefix to avoid cross-handler firing
     app.add_handler(CallbackQueryHandler(cb_noop,   pattern=r"^noop$"))

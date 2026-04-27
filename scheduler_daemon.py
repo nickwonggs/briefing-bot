@@ -42,6 +42,7 @@ from zoneinfo import ZoneInfo
 
 # Project imports (run after logging is configured)
 import briefing_engine as engine
+import gym_engine as gym
 import telegram_bot as tbot
 
 load_dotenv()
@@ -93,12 +94,30 @@ def _run_morning_briefing() -> None:
         log.error(f"[SCHEDULED_MORNING] [FAIL] [{type(exc).__name__}]")
 
 
+def _run_gym_checkin() -> None:
+    log.info("[SCHEDULED_GYM_CHECKIN] [START]")
+    try:
+        current = gym.current_split_name()
+        nxt = gym.next_split_name()
+        text = (
+            "🏋️ Weekly Gym Check-in!\n\n"
+            "Which days are you planning to gym next week?\n"
+            "Reply with: /days MON TUE WED THU FRI SAT SUN\n\n"
+            f"Current split: {current} Day — next session will be {nxt} Day."
+        )
+        asyncio.run(tbot.send_message(text))
+        log.info("[SCHEDULED_GYM_CHECKIN] [OK]")
+    except Exception as exc:
+        log.error(f"[SCHEDULED_GYM_CHECKIN] [FAIL] [{type(exc).__name__}]")
+
+
 def _setup_schedules() -> None:
     # Times in Singapore time (SGT = UTC+8)
     # schedule library uses datetime.now() which respects the TZ env var
     schedule.every().day.at("09:00").do(_run_morning_briefing)
     schedule.every().day.at("17:00").do(_run_evening_briefing)
-    log.info("[SCHEDULES_REGISTERED] [09:00_MORNING] [17:00_EVENING]")
+    schedule.every().friday.at("17:00").do(_run_gym_checkin)
+    log.info("[SCHEDULES_REGISTERED] [09:00_MORNING] [17:00_EVENING] [FRI_17:00_GYM_CHECKIN]")
 
 
 def _run_schedule_loop() -> None:
