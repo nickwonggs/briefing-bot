@@ -897,9 +897,9 @@ def summarise_emails(received: list[dict], sent: list[dict]) -> Optional[str]:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if api_key:
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel("gemini-1.5-flash")
+            from google import genai
+
+            client = genai.Client(api_key=api_key)
 
             lines: list[str] = []
             if received:
@@ -918,7 +918,9 @@ def summarise_emails(received: list[dict], sent: list[dict]) -> Optional[str]:
                 "Call out anything that needs attention or follow-up. "
                 "Be direct — no greetings, no sign-off:\n\n" + "\n".join(lines)
             )
-            response = model.generate_content(prompt)
+            response = client.models.generate_content(
+                model="gemini-2.0-flash-lite", contents=prompt
+            )
             return response.text.strip()
         except Exception as exc:
             log.error(f"[EMAIL_SUMMARY] [GEMINI_FAIL] [{type(exc).__name__}] {exc} — falling back to rule-based")
