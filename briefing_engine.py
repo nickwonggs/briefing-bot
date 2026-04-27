@@ -392,8 +392,13 @@ def mark_local_task_done_by_title(title: str) -> bool:
     return False
 
 
-def mark_google_task_done_by_id(task_list_id: str, task_id: str, label: str) -> bool:
-    """Mark a specific Google Task as completed by IDs. label = 'Personal' | 'Work'."""
+def mark_google_task_done_by_id(task_list_id: str, task_id: str, label: str,
+                                  title: Optional[str] = None) -> bool:
+    """
+    Mark a specific Google Task as completed by IDs. label = 'Personal' | 'Work'.
+    If label is 'Personal' and title is provided, also syncs the local store so
+    the task does not reappear in /tasks after being marked done.
+    """
     try:
         if label == "Personal":
             creds = _build_personal_credentials()
@@ -409,6 +414,9 @@ def mark_google_task_done_by_id(task_list_id: str, task_id: str, label: str) -> 
             body={"status": "completed"},
         ).execute()
         log.info(f"[MARK_GOOGLE_TASK_BY_ID] [{label}] [OK]")
+        # Sync local store so the task doesn't reappear in /tasks
+        if label == "Personal" and title:
+            mark_local_task_done_by_title(title)
         return True
     except Exception:
         log.error(f"[MARK_GOOGLE_TASK_BY_ID] [{label}] [FAIL]")
@@ -446,6 +454,35 @@ def reschedule_local_task_by_title(title: str, new_date: date) -> bool:
             log.info("[RESCHEDULE_LOCAL_TASK] [OK]")
             return True
     return False
+
+
+def set_task_priority(title: str, priority: str) -> Optional[str]:
+    """
+    Fuzzy-match a work task by title and update its priority (P0–P3).
+    Returns the matched task title, or None if not found.
+    """
+    if priority not in ("P0", "P1", "P2", "P3"):
+        return None
+    needle = title.lower().strip()
+    tasks = load_tasks()
+    best = None
+    best_score = 0
+    for t in tasks:
+        if "work" not in t.get("type", "").lower():
+            continue
+        if t.get("status") == "done":
+            continue
+        task_title = t.get("title", "").lower()
+        score = len([w for w in needle.split() if w in task_title])
+        if score > best_score:
+            best_score = score
+            best = t
+    if best and best_score > 0:
+        best["priority"] = priority
+        save_tasks(tasks)
+        log.info(f"[SET_PRIORITY] [{priority}] [OK]")
+        return best["title"]
+    return None
 
 
 def rename_task(old_title: str, new_title: str) -> Optional[str]:
@@ -832,10 +869,28 @@ def _is_spam(sender: str, subject: str) -> bool:
     return bool(SPAM_PATTERNS.search(sender) or SPAM_PATTERNS.search(subject))
 
 
+def _format_email_line(e: dict, urgent: bool = False) -> str:
+    """Format a single email entry for briefing output."""
+    subj = _h(e["subject"])
+    snip = _h(e["snippet"]) if e.get("snippet") else ""
+    snip_part = f": <i>{snip}</i>" if snip else ""
+    if e.get("is_sent"):
+        return f"📤 To: <b>{_h(e['to'])}</b> — {subj}{snip_part}"
+    prefix = "🔴 " if urgent else "📥 "
+    return f"{prefix}<b>{_h(e['sender'])}</b> — {subj}{snip_part}"
+
+
+def _email_display_name(full_addr: str) -> str:
+    """Extract 'Name' from 'Name <email@example.com>', else return the raw string."""
+    m = re.match(r'^"?([^"<]+)"?\s*<', full_addr)
+    return m.group(1).strip() if m else full_addr.strip()
+
+
 def fetch_emails(since_hours: int = 24) -> dict:
     """
     Returns {"urgent": [...], "normal": [...], "deferred_count": int}
-    Each item: {"sender": str, "subject": str, "is_unread": bool, "age_hours": float}
+    Each item: {"sender": str, "to": str, "subject": str, "snippet": str,
+                "is_unread": bool, "is_sent": bool, "age_hours": float}
     """
     log.info("[FETCH_EMAILS] [START]")
     creds = _build_credentials()
@@ -863,16 +918,19 @@ def fetch_emails(since_hours: int = 24) -> dict:
                 userId="me",
                 id=msg_ref["id"],
                 format="metadata",
-                metadataHeaders=["From", "Subject", "Date"],
+                metadataHeaders=["From", "To", "Subject", "Date"],
             ).execute()
         except Exception:
             continue
 
         headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
         sender = headers.get("From", "")
+        to_addr = headers.get("To", "")
         subject = headers.get("Subject", "")
+        snippet = msg.get("snippet", "")
         labels = msg.get("labelIds", [])
         is_unread = "UNREAD" in labels
+        is_sent = "SENT" in labels and "INBOX" not in labels
 
         if _is_spam(sender, subject):
             continue
@@ -882,9 +940,12 @@ def fetch_emails(since_hours: int = 24) -> dict:
         age_hours = (datetime.now(TZ) - msg_time).total_seconds() / 3600
 
         item = {
-            "sender": sender,
+            "sender": _email_display_name(sender),
+            "to": _email_display_name(to_addr),
             "subject": subject,
+            "snippet": snippet[:120],
             "is_unread": is_unread,
+            "is_sent": is_sent,
             "age_hours": round(age_hours, 1),
         }
 
@@ -1212,7 +1273,7 @@ def _top_priorities_split(tasks: list[dict], google_tasks: list[dict],
                       and t.get("status") in ("overdue", "in_progress")
                       and not t.get("auto_generated")]
 
-    def _pick3(candidates, show_priority: bool = False):
+    def _pick3(candidates, show_priority: bool = False, show_type: bool = False):
         seen: set[str] = set()
         unique = []
         for c in candidates:
@@ -1226,6 +1287,16 @@ def _top_priorities_split(tasks: list[dict], google_tasks: list[dict],
         for i, p in enumerate(unique):
             if show_priority and p.get("priority"):
                 badge = f"{_PRIORITY_EMOJI.get(p['priority'], '')} <b>{p['priority']}</b> "
+            elif show_type:
+                # Use task list tag for Google Tasks, or type field for local tasks
+                tl = p.get("task_list", "")
+                t_type = p.get("type", "")
+                if "gym" in tl.lower() or "gym" in t_type.lower():
+                    badge = "🏋️ "
+                elif "vacation" in tl.lower() or "🌴" in t_type:
+                    badge = "🌴 "
+                else:
+                    badge = "👤 "
             else:
                 badge = ""
             result.append(f"{i+1}. {badge}{_h(p['title'])}")
@@ -1261,7 +1332,7 @@ def _top_priorities_split(tasks: list[dict], google_tasks: list[dict],
         lines += [""]
 
     lines += ["👤 <b>Personal</b>"]
-    lines.extend(_pick3(personal_combined))
+    lines.extend(_pick3(personal_combined, show_type=True))
     return "\n".join(lines)
 
 
@@ -1279,7 +1350,12 @@ def _render_event_line(ev: dict) -> str:
     if ev.get("attachments"):
         att = ", ".join(_h(a.get("title", "file")) for a in ev["attachments"][:2])
         note += f" — 📎 {att}"
-    return f"{ev['time']} — {_h(ev['title'])} {ev['tag']}{note}"
+    # Build time string: "All day" or "9:00 AM → 10:30 AM"
+    if ev.get("end_dt") and ev["time"] != "All day":
+        time_str = f"{ev['time']} → {ev['end_dt'].strftime('%I:%M %p').lstrip('0')}"
+    else:
+        time_str = ev["time"]
+    return f"{time_str} — {_h(ev['title'])} {ev['tag']}{note}"
 
 
 def build_evening_briefing(target_date: date) -> str:
@@ -1338,9 +1414,9 @@ def build_evening_briefing(target_date: date) -> str:
         lines.append(f"📥 {email_data['deferred_count']} work emails received — deferred (OOO/weekend)")
     elif not effective_weekend:
         for e in email_data["urgent"]:
-            lines.append(f"🔴 {_h(e['sender'])} — {_h(e['subject'])} <i>(action required)</i>")
+            lines.append(_format_email_line(e, urgent=True) + " <i>(action required)</i>")
         for e in email_data["normal"]:
-            lines.append(f"• {_h(e['sender'])} — {_h(e['subject'])}")
+            lines.append(_format_email_line(e))
     if not email_data["urgent"] and not email_data["normal"] and not email_data["deferred_count"]:
         lines.append("No new emails.")
 
@@ -1425,9 +1501,9 @@ def build_morning_briefing() -> str:
         lines.append(f"📥 {email_data['deferred_count']} work emails received — deferred (OOO/weekend)")
     elif not effective_weekend:
         for e in email_data["urgent"]:
-            lines.append(f"🔴 {_h(e['sender'])} — {_h(e['subject'])} <i>(action required)</i>")
+            lines.append(_format_email_line(e, urgent=True) + " <i>(action required)</i>")
         for e in email_data["normal"]:
-            lines.append(f"• {_h(e['sender'])} — {_h(e['subject'])}")
+            lines.append(_format_email_line(e))
     if not email_data["urgent"] and not email_data["normal"] and not email_data.get("deferred_count"):
         lines.append("No overnight emails.")
 

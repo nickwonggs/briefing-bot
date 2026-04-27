@@ -343,12 +343,15 @@ def _parse_add_args(raw: str) -> dict:
         rrule, recurrence_display = engine.parse_task_recurrence(every_m.group(1).strip())
         raw = raw[:every_m.start()].strip()
 
-    # Date: "on [date]" at the end
+    # Date: "on [date]" at the end — only strip if the date actually parses,
+    # so "on" inside a task title (e.g. "help with X on Y stuff") is preserved.
     due_date = None
     on_m = re.search(r"\s+on\s+(.+)$", raw, re.IGNORECASE)
     if on_m:
-        due_date = engine.parse_task_date(on_m.group(1).strip())
-        raw = raw[:on_m.start()].strip()
+        parsed_date = engine.parse_task_date(on_m.group(1).strip())
+        if parsed_date is not None:
+            due_date = parsed_date
+            raw = raw[:on_m.start()].strip()
 
     return {
         "is_work": is_work,
@@ -496,6 +499,30 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 )
             return
 
+        # ── Priority change: any text containing p0–p3 ────────────────────
+        p_m = re.search(r"\bp([0-3])\b", sanitised, re.IGNORECASE)
+        if p_m and not sanitised.lower().startswith("done "):
+            new_priority = f"P{p_m.group(1).upper()}"
+            task_name = (sanitised[:p_m.start()] + sanitised[p_m.end():]).strip()
+            task_name = re.sub(r"\s{2,}", " ", task_name).strip()
+            if not task_name:
+                await update.message.reply_text(
+                    "Usage: /update [task name] p0  — e.g. /update publish article p1"
+                )
+                return
+            matched = engine.set_task_priority(task_name, new_priority)
+            if matched:
+                badge = {"P0": "🔴", "P1": "🟠", "P2": "🟡", "P3": "🟢"}.get(new_priority, "")
+                await update.message.reply_text(
+                    f"{badge} Priority set to {new_priority}: {matched}"
+                )
+                log.info(f"[CMD_UPDATE] [PRIORITY] [{new_priority}] [OK]")
+            else:
+                await update.message.reply_text(
+                    f"No work task matching \"{task_name}\" found. Check /tasks for names."
+                )
+            return
+
         # ── Quick done shortcut: "done [task name]" ───────────────────────
         if sanitised.lower().startswith("done "):
             task_name = sanitised[5:].strip()
@@ -514,6 +541,7 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "📋 /update options:\n\n"
             "• /update — dropdown to mark done or reschedule\n"
             "• /update old name > new name — rename a task\n"
+            "• /update [task] p0 — change priority (p0–p3)\n"
             "• /update done [task name] — quick mark done"
         )
 
@@ -556,6 +584,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Updating tasks:\n"
         "  /update — dropdown: ✅ Done | 📅 Today | 📅 +1 day\n"
         "  /update old > new — rename a task\n"
+        "  /update [task] p0 — change priority (p0–p3)\n"
         "  /update done [task] — quick mark done\n\n"
         "/weekend — Personal schedule only\n"
         "/help — This message",
@@ -622,7 +651,7 @@ async def cb_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if task["source"] == "google":
         success = engine.mark_google_task_done_by_id(
-            task["task_list_id"], task["task_id"], task["label"]
+            task["task_list_id"], task["task_id"], task["label"], title=title
         )
     else:
         success = engine.mark_local_task_done_by_title(title)
@@ -684,7 +713,7 @@ async def cb_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if action == "done":
         if task["source"] == "google":
             success = engine.mark_google_task_done_by_id(
-                task["task_list_id"], task["task_id"], label
+                task["task_list_id"], task["task_id"], label, title=title
             )
         else:
             success = engine.mark_local_task_done_by_title(title)
