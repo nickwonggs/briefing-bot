@@ -114,10 +114,10 @@ def _run_gym_checkin() -> None:
 def _setup_schedules() -> None:
     # Times in Singapore time (SGT = UTC+8)
     # schedule library uses datetime.now() which respects the TZ env var
-    schedule.every().day.at("09:00").do(_run_morning_briefing)
-    schedule.every().day.at("17:00").do(_run_evening_briefing)
-    schedule.every().friday.at("17:00").do(_run_gym_checkin)
-    log.info("[SCHEDULES_REGISTERED] [09:00_MORNING] [17:00_EVENING] [FRI_17:00_GYM_CHECKIN]")
+    schedule.every().day.at("08:00").do(_run_morning_briefing)
+    schedule.every().day.at("19:00").do(_run_evening_briefing)
+    schedule.every().friday.at("20:00").do(_run_gym_checkin)
+    log.info("[SCHEDULES_REGISTERED] [08:00_MORNING] [19:00_EVENING] [FRI_20:00_GYM_CHECKIN]")
 
 
 def _run_schedule_loop() -> None:

@@ -575,6 +575,37 @@ def _rename_google_task_fuzzy(needle: str, new_title: str, label: Optional[str])
     return None
 
 
+def append_to_task(partial_title: str, extra_text: str) -> Optional[str]:
+    """
+    Fuzzy-match a task and append extra_text to its title.
+    Personal tasks are synced to Google. Returns the new full title, or None if not found.
+    """
+    needle = partial_title.lower().strip()
+    extra_text = extra_text.strip()[:200]
+    if not extra_text:
+        return None
+    tasks = load_tasks()
+    best = None
+    best_score = 0
+    for t in tasks:
+        title = t.get("title", "").lower()
+        score = len([w for w in needle.split() if w in title])
+        if score > best_score:
+            best_score = score
+            best = t
+    if best and best_score > 0:
+        old_title = best["title"]
+        new_title = (old_title + " " + extra_text)[:200]
+        is_personal = "personal" in best.get("type", "").lower()
+        best["title"] = new_title
+        save_tasks(tasks)
+        log.info("[APPEND_TASK] [OK]")
+        if is_personal:
+            _rename_google_task_fuzzy(old_title, new_title, "Personal")
+        return new_title
+    return None
+
+
 def rename_google_task_by_id(task_list_id: str, task_id: str, new_title: str, label: str) -> bool:
     """Rename a specific Google Task by IDs. label = 'Personal' | 'Work'."""
     try:
@@ -903,24 +934,34 @@ def summarise_emails(received: list[dict], sent: list[dict]) -> Optional[str]:
             if received:
                 lines.append("RECEIVED:")
                 for e in received:
-                    snip = f" | Preview: {e['snippet']}" if e.get("snippet") else ""
-                    lines.append(f"  - From: {e['sender']} | Subject: {e['subject']}{snip}")
+                    content = e.get("body") or e.get("snippet") or ""
+                    content_note = f"\n    Content: {content[:300]}" if content else ""
+                    lines.append(
+                        f"  - From: {e['sender']} | Subject: {e['subject']}{content_note}"
+                    )
             if sent:
                 lines.append("SENT:")
                 for e in sent:
-                    snip = f" | Preview: {e['snippet']}" if e.get("snippet") else ""
-                    lines.append(f"  - To: {e['to']} | Subject: {e['subject']}{snip}")
+                    content = e.get("body") or e.get("snippet") or ""
+                    content_note = f"\n    Content: {content[:200]}" if content else ""
+                    lines.append(
+                        f"  - To: {e['to']} | Subject: {e['subject']}{content_note}"
+                    )
 
             prompt = (
-                "Summarise these work emails in 2–3 concise sentences. "
-                "Call out anything that needs attention or follow-up. "
-                "Be direct — no greetings, no sign-off:\n\n" + "\n".join(lines)
+                "You are reviewing work emails for a busy professional.\n\n"
+                "1. Write a 2–3 sentence summary of what happened across all emails.\n"
+                "2. If any email is a meeting invite, note the meeting name and agenda.\n"
+                "3. On a new line starting with 'Tasks:', list any action items or "
+                "follow-ups as bullet points (• item). If none, omit the Tasks section.\n\n"
+                "Be direct — no greetings, no sign-off.\n\n"
+                + "\n".join(lines)
             )
             client = Groq(api_key=api_key)
             response = client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=200,
+                max_tokens=400,
             )
             return response.choices[0].message.content.strip()
         except Exception as exc:
@@ -948,6 +989,60 @@ def summarise_emails(received: list[dict], sent: list[dict]) -> Optional[str]:
         parts.append(f"{n} email{'s' if n != 1 else ''} sent to {', '.join(recipients)}.")
 
     return " ".join(parts) or None
+
+
+def _extract_email_body(payload: dict) -> str:
+    """
+    Extract readable text from a Gmail message payload (full format).
+    Handles simple messages, multipart/alternative, and meeting invites (text/calendar).
+    Returns up to 600 chars of plain text, or '[Invite] …' for calendar parts.
+    """
+    def _decode(data: str) -> str:
+        try:
+            return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    mime = payload.get("mimeType", "")
+
+    if mime == "text/plain":
+        raw = payload.get("body", {}).get("data", "")
+        return _decode(raw)[:600].strip() if raw else ""
+
+    if mime.startswith("multipart/"):
+        plain = ""
+        cal_info = ""
+        for part in payload.get("parts", []):
+            pm = part.get("mimeType", "")
+            if pm == "text/plain" and not plain:
+                raw = part.get("body", {}).get("data", "")
+                plain = _decode(raw)[:600].strip() if raw else ""
+            elif pm in ("text/calendar", "application/ics") and not cal_info:
+                raw = part.get("body", {}).get("data", "")
+                if raw:
+                    cal = _decode(raw)
+                    out = []
+                    m = re.search(r"SUMMARY:([^\r\n]+)", cal)
+                    if m:
+                        out.append(f"Meeting: {m.group(1).strip()[:100]}")
+                    m = re.search(r"LOCATION:([^\r\n]+)", cal)
+                    if m:
+                        out.append(f"Location: {m.group(1).strip()[:80]}")
+                    m = re.search(r"DESCRIPTION:(.*?)(?:\r?\n[A-Z\-]+:|\Z)", cal, re.DOTALL)
+                    if m:
+                        desc = re.sub(r"\\n|\n|\r", " ", m.group(1)).strip()[:250]
+                        if desc:
+                            out.append(f"Agenda: {desc}")
+                    cal_info = " | ".join(out)
+            elif pm.startswith("multipart/") and not plain:
+                nested = _extract_email_body(part)
+                if nested and not nested.startswith("[Invite]"):
+                    plain = nested
+        if cal_info:
+            return f"[Invite] {cal_info}"
+        return plain
+
+    return ""
 
 
 def fetch_emails(since_hours: int = 24) -> dict:
@@ -981,17 +1076,18 @@ def fetch_emails(since_hours: int = 24) -> dict:
             msg = service.users().messages().get(
                 userId="me",
                 id=msg_ref["id"],
-                format="metadata",
-                metadataHeaders=["From", "To", "Subject", "Date"],
+                format="full",
             ).execute()
         except Exception:
             continue
 
-        headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+        payload = msg.get("payload", {})
+        headers = {h["name"]: h["value"] for h in payload.get("headers", [])}
         sender = headers.get("From", "")
         to_addr = headers.get("To", "")
         subject = headers.get("Subject", "")
         snippet = msg.get("snippet", "")
+        body = _extract_email_body(payload)
         labels = msg.get("labelIds", [])
         is_unread = "UNREAD" in labels
         is_sent = "SENT" in labels and "INBOX" not in labels
@@ -1008,6 +1104,7 @@ def fetch_emails(since_hours: int = 24) -> dict:
             "to": _email_display_name(to_addr),
             "subject": subject,
             "snippet": snippet[:120],
+            "body": body,
             "is_unread": is_unread,
             "is_sent": is_sent,
             "age_hours": round(age_hours, 1),

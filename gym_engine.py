@@ -277,30 +277,163 @@ def delete_gym_event(target_date: date) -> bool:
         return False
 
 
-def cascade_skip(skipped_date: date) -> list[str]:
-    """
-    After skipping skipped_date, find all remaining gym events later this week,
-    delete them, and recreate them in order so their split labels stay correct.
-    Returns a list of human-readable result lines (one per rescheduled day).
-    """
-    today = date.today()
-    monday = today - timedelta(days=today.weekday())
-    sunday = monday + timedelta(days=6)
+def _extract_split_from_title(title: str) -> Optional[str]:
+    for split in ("Push", "Pull", "Legs", "Rest"):
+        if split in title:
+            return split
+    return None
 
-    gym_cal_id = find_gym_calendar_id()
-    if gym_cal_id is None:
-        return []
 
+def _split_idx(split_name: str) -> int:
+    """Return the first index of split_name in SPLIT_ROTATION."""
     try:
+        return next(i for i, s in enumerate(SPLIT_ROTATION) if s == split_name)
+    except StopIteration:
+        return 0
+
+
+def _direct_create_event(
+    svc,
+    gym_cal_id: str,
+    target_date: date,
+    split_name: str,
+    forced_time: Optional[time] = None,
+) -> str:
+    """
+    Create a single gym event for target_date without touching global split state.
+    If forced_time is given, uses that instead of finding a free slot.
+    Returns a human-readable result line.
+    """
+    if split_name == "Rest":
+        return f"Rest day on {target_date.strftime('%a %-d %b')} — no session created."
+
+    if forced_time is not None:
+        slot_start = datetime.combine(target_date, forced_time).replace(tzinfo=TZ)
+    else:
+        slot_start = find_free_slot(target_date)
+    if slot_start is None:
+        return f"⚠️ No free slot on {target_date.strftime('%a %-d %b')} — skipped."
+
+    slot_end = slot_start + timedelta(hours=2)
+    try:
+        svc.events().insert(calendarId=gym_cal_id, body={
+            "summary": f"🏋️ Gym — {split_name} Day",
+            "description": _DESCRIPTIONS.get(split_name, ""),
+            "start": {"dateTime": slot_start.isoformat(), "timeZone": "Asia/Singapore"},
+            "end":   {"dateTime": slot_end.isoformat(),   "timeZone": "Asia/Singapore"},
+        }).execute()
+        time_str = f"{slot_start.strftime('%-I:%M %p')} – {slot_end.strftime('%-I:%M %p')}"
+        log.info(f"[GYM_ENGINE] [CASCADE_CREATED] [{split_name}] [{target_date}]")
+        return f"↩️ {split_name} Day on {target_date.strftime('%a %-d %b')} at {time_str}."
+    except Exception as exc:
+        log.error(f"[GYM_ENGINE] [CASCADE_INSERT_FAIL] [{type(exc).__name__}] {exc}")
+        return f"Failed to create event on {target_date.strftime('%a %-d %b')}."
+
+
+def cascade_skip(skipped_date: date) -> tuple[bool, list[str]]:
+    """
+    Delete the gym event on skipped_date and reassign splits to all remaining
+    gym events this week after it. Reads splits from event titles — does NOT
+    touch the global split state.
+    Returns (deleted_today, cascade_result_lines).
+    """
+    try:
+        gym_cal_id = find_gym_calendar_id()
+        if gym_cal_id is None:
+            return False, []
+
         svc = _cal_service()
-        # Find gym events strictly after the skipped date, within this week
-        search_start = datetime.combine(skipped_date + timedelta(days=1), time(0, 0)).replace(tzinfo=TZ)
+        monday = skipped_date - timedelta(days=skipped_date.weekday())
+        sunday = monday + timedelta(days=6)
+
+        # ── Step 1: find and delete today's event, record its split ──────────
+        today_start = datetime.combine(skipped_date, time(0, 0)).replace(tzinfo=TZ)
+        today_end = today_start + timedelta(days=1)
+        today_events = svc.events().list(
+            calendarId=gym_cal_id,
+            timeMin=today_start.isoformat(),
+            timeMax=today_end.isoformat(),
+            singleEvents=True,
+        ).execute().get("items", [])
+
+        today_split: Optional[str] = None
+        deleted_today = False
+        for ev in today_events:
+            if "🏋️ Gym" not in ev.get("summary", ""):
+                continue
+            today_split = _extract_split_from_title(ev.get("summary", ""))
+            svc.events().delete(calendarId=gym_cal_id, eventId=ev["id"]).execute()
+            deleted_today = True
+            log.info(f"[GYM_ENGINE] [SKIP_DELETED] [{skipped_date}]")
+
+        if today_split is None:
+            return deleted_today, []
+
+        # ── Step 2: find remaining gym events this week, delete them ─────────
+        future_start = datetime.combine(skipped_date + timedelta(days=1), time(0, 0)).replace(tzinfo=TZ)
+        week_end = datetime.combine(sunday, time(23, 59)).replace(tzinfo=TZ)
+        if future_start > week_end:
+            return deleted_today, []
+
+        future_events = svc.events().list(
+            calendarId=gym_cal_id,
+            timeMin=future_start.isoformat(),
+            timeMax=week_end.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+        ).execute().get("items", [])
+
+        future_dates: list[date] = []
+        for ev in future_events:
+            if "🏋️ Gym" not in ev.get("summary", ""):
+                continue
+            start_raw = ev["start"].get("dateTime", "")
+            if not start_raw:
+                continue
+            start_dt = datetime.fromisoformat(start_raw).astimezone(TZ)
+            future_dates.append(start_dt.date())
+            svc.events().delete(calendarId=gym_cal_id, eventId=ev["id"]).execute()
+
+        if not future_dates:
+            return deleted_today, []
+
+        # ── Step 3: recreate with splits derived from today's split + offset ──
+        start_idx = _split_idx(today_split)
+        results = []
+        for offset, d in enumerate(future_dates):
+            split = SPLIT_ROTATION[(start_idx + 1 + offset) % len(SPLIT_ROTATION)]
+            results.append(_direct_create_event(svc, gym_cal_id, d, split))
+
+        return deleted_today, results
+
+    except Exception as exc:
+        log.error(f"[GYM_ENGINE] [CASCADE_SKIP_FAIL] [{type(exc).__name__}] {exc}")
+        return False, []
+
+
+def cascade_reschedule(new_date: date, forced_time: Optional[time] = None) -> list[str]:
+    """
+    Schedule a session on new_date and cascade all existing gym events from
+    new_date onwards so their splits stay in the correct sequence.
+    - If existing sessions exist on/after new_date, new_date takes the same
+      split as the earliest of those (they shift forward by one).
+    - If new_date is after all existing sessions, uses global split state.
+    Updates global split state when done.
+    Returns list of result lines for every date affected.
+    """
+    try:
+        gym_cal_id = find_gym_calendar_id()
+        if gym_cal_id is None:
+            return ["Could not find Gym calendar."]
+
+        svc = _cal_service()
+        monday = new_date - timedelta(days=new_date.weekday())
+        sunday = monday + timedelta(days=6)
+
+        search_start = datetime.combine(new_date, time(0, 0)).replace(tzinfo=TZ)
         week_end = datetime.combine(sunday, time(23, 59)).replace(tzinfo=TZ)
 
-        if search_start > week_end:
-            return []
-
-        events = svc.events().list(
+        existing_events = svc.events().list(
             calendarId=gym_cal_id,
             timeMin=search_start.isoformat(),
             timeMax=week_end.isoformat(),
@@ -308,28 +441,122 @@ def cascade_skip(skipped_date: date) -> list[str]:
             orderBy="startTime",
         ).execute().get("items", [])
 
-        # Collect dates of existing gym events then delete them all first
-        dates_to_reschedule: list[date] = []
-        for ev in events:
+        # Collect existing gym events (date, split, event_id)
+        existing: list[tuple[date, Optional[str], str]] = []
+        for ev in existing_events:
             if "🏋️ Gym" not in ev.get("summary", ""):
                 continue
             start_raw = ev["start"].get("dateTime", "")
             if not start_raw:
                 continue
             start_dt = datetime.fromisoformat(start_raw).astimezone(TZ)
-            dates_to_reschedule.append(start_dt.date())
-            svc.events().delete(calendarId=gym_cal_id, eventId=ev["id"]).execute()
+            existing.append((
+                start_dt.date(),
+                _extract_split_from_title(ev.get("summary", "")),
+                ev["id"],
+            ))
 
+        # Determine the starting split for new_date
+        if existing:
+            first_split = existing[0][1] or current_split_name()
+        else:
+            first_split = current_split_name()
+
+        # Delete all existing events from new_date onwards
+        for _, _, ev_id in existing:
+            svc.events().delete(calendarId=gym_cal_id, eventId=ev_id).execute()
+
+        # Build sorted date list: new_date + existing dates (excluding new_date if present)
+        existing_dates = [d for d, _, _ in existing if d != new_date]
+        all_dates = sorted([new_date] + existing_dates)
+
+        # Create events with cascaded splits
+        start_idx = _split_idx(first_split)
         results = []
-        for d in dates_to_reschedule:
-            ok, msg = schedule_gym_session(d)
-            results.append(msg)
+        for offset, d in enumerate(all_dates):
+            split = SPLIT_ROTATION[(start_idx + offset) % len(SPLIT_ROTATION)]
+            ft = forced_time if (d == new_date and forced_time is not None) else None
+            results.append(_direct_create_event(svc, gym_cal_id, d, split, forced_time=ft))
+
+        # Update global split state so next /days call starts at the right position
+        save_split_state((start_idx + len(all_dates)) % len(SPLIT_ROTATION))
 
         return results
 
     except Exception as exc:
-        log.error(f"[GYM_ENGINE] [CASCADE_SKIP_FAIL] [{type(exc).__name__}] {exc}")
-        return []
+        log.error(f"[GYM_ENGINE] [CASCADE_RESCHEDULE_FAIL] [{type(exc).__name__}] {exc}")
+        return [f"Something went wrong during cascade. Check Railway logs."]
+
+
+def setsplit_and_cascade(target_date: date, new_split_name: str) -> list[str]:
+    """
+    Change the split for the gym event on target_date to new_split_name,
+    then cascade all subsequent gym events this week so their splits stay in sequence.
+    Returns list of result messages.
+    """
+    if new_split_name not in SPLIT_ROTATION:
+        return [f"Invalid split '{new_split_name}'. Use: Push, Pull, Legs, or Rest."]
+    try:
+        gym_cal_id = find_gym_calendar_id()
+        if gym_cal_id is None:
+            return ["Could not find Gym calendar."]
+        svc = _cal_service()
+        monday = target_date - timedelta(days=target_date.weekday())
+        sunday = monday + timedelta(days=6)
+
+        # Delete target date's existing event
+        day_start = datetime.combine(target_date, time(0, 0)).replace(tzinfo=TZ)
+        day_end = day_start + timedelta(days=1)
+        for ev in svc.events().list(
+            calendarId=gym_cal_id,
+            timeMin=day_start.isoformat(),
+            timeMax=day_end.isoformat(),
+            singleEvents=True,
+        ).execute().get("items", []):
+            if "🏋️ Gym" in ev.get("summary", ""):
+                svc.events().delete(calendarId=gym_cal_id, eventId=ev["id"]).execute()
+
+        # Create event with the new split on target_date
+        today_result = _direct_create_event(svc, gym_cal_id, target_date, new_split_name)
+
+        # Cascade remaining gym events this week after target_date
+        future_start = datetime.combine(target_date + timedelta(days=1), time(0, 0)).replace(tzinfo=TZ)
+        week_end = datetime.combine(sunday, time(23, 59)).replace(tzinfo=TZ)
+        if future_start > week_end:
+            save_split_state((_split_idx(new_split_name) + 1) % len(SPLIT_ROTATION))
+            return [today_result]
+
+        future_events = svc.events().list(
+            calendarId=gym_cal_id,
+            timeMin=future_start.isoformat(),
+            timeMax=week_end.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+        ).execute().get("items", [])
+
+        future_dates: list[date] = []
+        for ev in future_events:
+            if "🏋️ Gym" not in ev.get("summary", ""):
+                continue
+            start_raw = ev["start"].get("dateTime", "")
+            if not start_raw:
+                continue
+            future_dates.append(datetime.fromisoformat(start_raw).astimezone(TZ).date())
+            svc.events().delete(calendarId=gym_cal_id, eventId=ev["id"]).execute()
+
+        start_idx = _split_idx(new_split_name)
+        results = [today_result]
+        for offset, d in enumerate(future_dates):
+            split = SPLIT_ROTATION[(start_idx + 1 + offset) % len(SPLIT_ROTATION)]
+            results.append(_direct_create_event(svc, gym_cal_id, d, split))
+
+        save_split_state((start_idx + 1 + len(future_dates)) % len(SPLIT_ROTATION))
+        log.info(f"[GYM_ENGINE] [SETSPLIT] [{new_split_name}] [{target_date}]")
+        return results
+
+    except Exception as exc:
+        log.error(f"[GYM_ENGINE] [SETSPLIT_FAIL] [{type(exc).__name__}] {exc}")
+        return ["Failed to update split. Check Railway logs."]
 
 
 def get_week_sessions() -> list[dict]:

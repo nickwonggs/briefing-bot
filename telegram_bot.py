@@ -243,7 +243,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/skip — Skip today, roll split forward\n"
         "/status — This week's gym sessions\n"
         "/next — Next split day (no change)\n"
-        "/reschedule [date] — Reschedule a day\n\n"
+        "/reschedule [date] [time] — Schedule on a date/time\n"
+        "/setsplit [date] [Push/Pull/Legs/Rest] — Change a day's split\n\n"
         "/help — Full command list",
         parse_mode=None,
     )
@@ -530,6 +531,21 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 )
             return
 
+        # ── Append: "task name + extra text" ──────────────────────────────
+        m_append = re.match(r'^(.+?)\s\+\s(.+)$', sanitised)
+        if m_append:
+            task_part = m_append.group(1).strip()
+            extra = m_append.group(2).strip()
+            new_title = engine.append_to_task(task_part, extra)
+            if new_title:
+                await update.message.reply_text(f"✏️ Updated: \"{new_title}\"")
+                log.info("[CMD_UPDATE] [APPEND] [OK]")
+            else:
+                await update.message.reply_text(
+                    f"No task matching \"{task_part}\" found. Check /tasks for names."
+                )
+            return
+
         # ── Quick done shortcut: "done [task name]" ───────────────────────
         if sanitised.lower().startswith("done "):
             task_name = sanitised[5:].strip()
@@ -596,10 +612,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/weekend — Personal schedule only\n\n"
         "Gym:\n"
         "  /days MON WED FRI — Schedule gym for those days next week\n"
-        "  /skip — Skip today, delete event, roll split forward\n"
+        "  /skip — Skip today, cascade remaining splits\n"
         "  /status — This week's scheduled gym sessions\n"
-        "  /next — Show next split day without changing state\n"
-        "  /reschedule [date] — Reschedule a day (e.g. /reschedule 2026-05-05)\n\n"
+        "  /next — Show next split without changing state\n"
+        "  /reschedule [date] [time] — Schedule on a date/time (e.g. /reschedule 5 may 3pm)\n"
+        "  /setsplit [date] [Push/Pull/Legs/Rest] — Change a day's split and cascade\n\n"
+        "Task append:\n"
+        "  /update [task] + [text] — Append text to a task title\n\n"
         "/help — This message",
         parse_mode=None,
     )
@@ -666,19 +685,15 @@ async def cmd_gym_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     log.info("[CMD_GYM_SKIP] [START]")
     try:
         today = date.today()
-        deleted = gym.delete_gym_event(today)
-        next_split = gym.advance_split()
-        cal_note = " Today's event removed." if deleted else ""
-        await update.message.reply_text(
-            f"Got it — skipping today.{cal_note}\n"
-            f"Next session: {next_split} Day. 💪\n\n"
-            f"Updating remaining sessions this week…",
-            parse_mode=None,
-        )
-        # Cascade: delete and recreate remaining gym events this week with corrected splits
-        cascaded = gym.cascade_skip(today)
-        if cascaded:
-            await update.message.reply_text("\n".join(cascaded), parse_mode=None)
+        await update.message.reply_text("Skipping today and updating this week's sessions…")
+        deleted, cascade = gym.cascade_skip(today)
+        cal_note = "Today's event removed." if deleted else "No gym event found for today."
+        reply = f"Got it — skipping today. {cal_note} 💪"
+        if cascade:
+            reply += "\n\nUpdated sessions this week:\n" + "\n".join(cascade)
+        else:
+            reply += "\nNo other sessions this week to update."
+        await update.message.reply_text(reply, parse_mode=None)
         log.info("[CMD_GYM_SKIP] [OK]")
     except Exception:
         log.error("[CMD_GYM_SKIP] [FAIL]")
@@ -727,6 +742,46 @@ async def cmd_gym_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(GENERIC_ERROR)
 
 
+def _parse_gym_time(text: str) -> Optional[time]:
+    """Parse '3pm', '14:00', '2:30pm' → time object."""
+    t = text.strip().lower()
+    m = re.match(r'^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$', t)
+    if m:
+        h, mins, period = int(m.group(1)), int(m.group(2) or 0), m.group(3)
+        if period == 'pm' and h != 12:
+            h += 12
+        elif period == 'am' and h == 12:
+            h = 0
+        try:
+            return time(h, mins)
+        except ValueError:
+            pass
+    m = re.match(r'^(\d{1,2}):(\d{2})$', t)
+    if m:
+        try:
+            return time(int(m.group(1)), int(m.group(2)))
+        except ValueError:
+            pass
+    return None
+
+
+def _parse_gym_datetime(raw: str):
+    """
+    Parse 'date [time]' from a reschedule arg.
+    Returns (date | None, time | None).
+    """
+    # Try to split off a trailing time token
+    forced_time = None
+    date_part = raw.strip()
+    m = re.search(r'\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{1,2}:\d{2})$', raw.strip(), re.IGNORECASE)
+    if m:
+        candidate = _parse_gym_time(m.group(1))
+        if candidate is not None:
+            forced_time = candidate
+            date_part = raw[:m.start()].strip()
+    return _parse_gym_date(date_part), forced_time
+
+
 async def cmd_gym_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update):
         return
@@ -735,26 +790,83 @@ async def cmd_gym_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE)
         raw = update.message.text.partition(" ")[2].strip()
         if not raw:
             await update.message.reply_text(
-                "Usage: /reschedule [date] — schedules a gym session ON that date.\n"
-                "Example: /reschedule 2026-05-05\n"
-                "Formats: YYYY-MM-DD, 5 May, May 5",
+                "Schedule a gym session ON a specific date/time.\n"
+                "Examples:\n"
+                "  /reschedule 2026-05-05\n"
+                "  /reschedule 5 may 3pm\n"
+                "  /reschedule 2026-05-05 14:00",
                 parse_mode=None,
             )
             return
-        target = _parse_gym_date(_sanitise(raw))
+        target, forced_time = _parse_gym_datetime(_sanitise(raw))
         if target is None:
             await update.message.reply_text(
-                f"Couldn't parse date '{raw}'. Try: /reschedule 2026-05-05",
+                f"Couldn't parse date from '{raw}'.\nTry: /reschedule 2026-05-05 or /reschedule 5 may 3pm",
                 parse_mode=None,
             )
             return
-        await update.message.reply_text(f"Scheduling your gym session for {target.strftime('%a %-d %b')}…")
-        gym.delete_gym_event(target)
-        ok, msg = gym.schedule_gym_session(target)
-        await update.message.reply_text(msg, parse_mode=None)
-        log.info(f"[CMD_GYM_RESCHEDULE] [{'OK' if ok else 'FAIL'}]")
+        time_note = f" at {forced_time.strftime('%-I:%M %p')}" if forced_time else ""
+        await update.message.reply_text(
+            f"Scheduling gym session for {target.strftime('%a %-d %b')}{time_note} and cascading this week…"
+        )
+        results = gym.cascade_reschedule(target, forced_time)
+        if results:
+            await update.message.reply_text("\n".join(results), parse_mode=None)
+        else:
+            await update.message.reply_text("Something went wrong. Check Railway logs.")
+        log.info("[CMD_GYM_RESCHEDULE] [OK]")
     except Exception:
         log.error("[CMD_GYM_RESCHEDULE] [FAIL]")
+        await update.message.reply_text(GENERIC_ERROR)
+
+
+async def cmd_gym_setsplit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update):
+        return
+    log.info("[CMD_GYM_SETSPLIT] [START]")
+    try:
+        raw = _sanitise(update.message.text.partition(" ")[2].strip())
+        _SPLIT_ALIASES = {
+            "push": "Push", "pull": "Pull", "legs": "Legs", "leg": "Legs",
+            "rest": "Rest", "off": "Rest",
+        }
+        # Expect: "[date] [split]" or just "[split]" (defaults to today)
+        tokens = raw.lower().split()
+        if not tokens:
+            await update.message.reply_text(
+                "Usage: /setsplit [date] [Push/Pull/Legs/Rest]\n"
+                "Examples:\n  /setsplit Push  (changes today)\n  /setsplit 5 may Legs",
+                parse_mode=None,
+            )
+            return
+
+        # Last token is the split name
+        split_raw = tokens[-1]
+        new_split = _SPLIT_ALIASES.get(split_raw)
+        if new_split is None:
+            await update.message.reply_text(
+                f"Unknown split '{split_raw}'. Use: Push, Pull, Legs, or Rest.",
+                parse_mode=None,
+            )
+            return
+
+        date_part = " ".join(tokens[:-1]).strip()
+        target = _parse_gym_date(date_part) if date_part else date.today()
+        if target is None:
+            await update.message.reply_text(
+                f"Couldn't parse date '{date_part}'. Try: /setsplit 5 may Push",
+                parse_mode=None,
+            )
+            return
+
+        await update.message.reply_text(
+            f"Setting {target.strftime('%a %-d %b')} to {new_split} Day and cascading…"
+        )
+        results = gym.setsplit_and_cascade(target, new_split)
+        await update.message.reply_text("\n".join(results) if results else "Done.", parse_mode=None)
+        log.info(f"[CMD_GYM_SETSPLIT] [{new_split}] [OK]")
+    except Exception:
+        log.error("[CMD_GYM_SETSPLIT] [FAIL]")
         await update.message.reply_text(GENERIC_ERROR)
 
 
@@ -981,6 +1093,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("next",       cmd_gym_next))
     app.add_handler(CommandHandler("reschedule", cmd_gym_reschedule))
     app.add_handler(CommandHandler("days",       cmd_gym_days))
+    app.add_handler(CommandHandler("setsplit",   cmd_gym_setsplit))
 
     # Inline keyboard callbacks — matched by prefix to avoid cross-handler firing
     app.add_handler(CallbackQueryHandler(cb_noop,   pattern=r"^noop$"))
