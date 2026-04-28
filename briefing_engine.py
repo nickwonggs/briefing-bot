@@ -365,14 +365,28 @@ def mark_task_done(task_name: str) -> Optional[str]:
 
     tasks = load_tasks()
     best = None
-    best_score = 0
+    best_score = 0.0
     for t in tasks:
+        if t.get("status") == "done":
+            continue
         title = t.get("title", "").lower()
-        score = len([w for w in needle.split() if w in title])
+        if needle in title:
+            score = 1.0
+        else:
+            needle_words = needle.split()
+            word_score = sum(
+                1 for w in needle_words
+                if any(tw.startswith(w) or w in tw for tw in title.split())
+            ) / max(len(needle_words), 1)
+            seq_score = SequenceMatcher(None, needle, title).ratio()
+            score = max(word_score, seq_score)
         if score > best_score:
             best_score = score
             best = t
-    if best and best_score > 0:
+
+    matched_title = best.get("title") if best else None
+    log.info(f"[MARK_DONE_LOCAL] [needle={needle!r}] [matched={matched_title!r}] [score={best_score:.2f}]")
+    if best and best_score >= 0.2:
         best["status"] = "done"
         best["done_at"] = datetime.now(TZ).isoformat()
         save_tasks(tasks)
@@ -576,6 +590,74 @@ def _rename_google_task_fuzzy(needle: str, new_title: str, label: Optional[str])
     return None
 
 
+def _append_google_task_fuzzy(needle: str, extra_text: str) -> Optional[tuple[str, str]]:
+    """
+    Search Google Tasks across both accounts, find the best fuzzy match for needle,
+    and append extra_text to its title. Returns (old_title, new_title) or None.
+    """
+    best_title = None
+    best_score = 0.0
+    best_list_id = None
+    best_task_id = None
+    best_service = None
+
+    def _search(service):
+        nonlocal best_title, best_score, best_list_id, best_task_id, best_service
+        try:
+            for tl in service.tasklists().list(maxResults=20).execute().get("items", []):
+                for task in service.tasks().list(
+                    tasklist=tl["id"], showCompleted=False, maxResults=100
+                ).execute().get("items", []):
+                    title = task.get("title", "").lower()
+                    if not title:
+                        continue
+                    if needle in title:
+                        score = 1.0
+                    else:
+                        needle_words = needle.split()
+                        word_score = sum(
+                            1 for w in needle_words
+                            if any(tw.startswith(w) or w in tw for tw in title.split())
+                        ) / max(len(needle_words), 1)
+                        seq_score = SequenceMatcher(None, needle, title).ratio()
+                        score = max(word_score, seq_score)
+                    if score > best_score:
+                        best_score = score
+                        best_title = task.get("title")
+                        best_list_id = tl["id"]
+                        best_task_id = task["id"]
+                        best_service = service
+        except Exception:
+            pass
+
+    personal_creds = _build_personal_credentials()
+    if personal_creds:
+        try:
+            _search(build("tasks", "v1", credentials=personal_creds))
+        except Exception:
+            pass
+    try:
+        _search(build("tasks", "v1", credentials=_build_credentials()))
+    except Exception:
+        pass
+
+    log.info(f"[APPEND_GOOGLE_TASK] [needle={needle!r}] [matched={best_title!r}] [score={best_score:.2f}]")
+    if best_score >= 0.2 and best_task_id and best_service:
+        old_title = best_title
+        new_title = old_title + " " + extra_text
+        try:
+            best_service.tasks().patch(
+                tasklist=best_list_id,
+                task=best_task_id,
+                body={"title": new_title},
+            ).execute()
+            log.info("[APPEND_GOOGLE_TASK] [OK]")
+            return old_title, new_title
+        except Exception as exc:
+            log.error(f"[APPEND_GOOGLE_TASK] [PATCH_FAIL] [{type(exc).__name__}]")
+    return None
+
+
 def append_to_task(partial_title: str, extra_text: str) -> Optional[tuple[str, str]]:
     """
     Fuzzy-match an active task and append extra_text to its title.
@@ -614,14 +696,17 @@ def append_to_task(partial_title: str, extra_text: str) -> Optional[tuple[str, s
         is_personal = "personal" in best.get("type", "").lower()
         best["title"] = new_title
         save_tasks(tasks)
-        log.info("[APPEND_TASK] [OK]")
+        log.info("[APPEND_TASK] [LOCAL] [OK]")
         if is_personal:
             try:
                 _rename_google_task_fuzzy(old_title, new_title, "Personal")
             except Exception as exc:
                 log.error(f"[APPEND_TASK] [GOOGLE_SYNC_FAIL] [{type(exc).__name__}]")
         return old_title, new_title
-    return None
+
+    # No local match — search Google Tasks directly (catches tasks added outside the bot)
+    log.info(f"[APPEND_TASK] [LOCAL_MISS] [falling_back_to_google]")
+    return _append_google_task_fuzzy(needle, extra_text)
 
 
 def rename_google_task_by_id(task_list_id: str, task_id: str, new_title: str, label: str) -> bool:
