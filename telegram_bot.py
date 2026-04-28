@@ -17,10 +17,10 @@ Security model:
 
 import os
 import re
-import time
+import time as _time_mod
 import logging
 import logging.handlers
-from datetime import datetime, timezone, date, timedelta
+from datetime import datetime, timezone, date, timedelta, time
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -89,7 +89,7 @@ def _is_authorised(chat_id: int) -> bool:
 
 
 def _is_rate_limited(chat_id: int) -> bool:
-    now = time.monotonic()
+    now = _time_mod.monotonic()
     last = _last_command_time.get(chat_id, 0)
     if now - last < RATE_LIMIT_SECONDS:
         log.info("[RATE_LIMIT] [BLOCKED]")
@@ -819,9 +819,12 @@ def _parse_gym_datetime(raw: str):
             date_str = " ".join(tokens[:-n])
             candidate_date = _parse_gym_date(date_str)
             if candidate_date is not None:
+                log.info(f"[PARSE_GYM_DATETIME] [raw={raw!r}] [date={candidate_date}] [time={candidate_time}]")
                 return candidate_date, candidate_time
     # No time found — parse whole input as date
-    return _parse_gym_date(raw.strip()), None
+    result_date = _parse_gym_date(raw.strip())
+    log.info(f"[PARSE_GYM_DATETIME] [raw={raw!r}] [date={result_date}] [time=None]")
+    return result_date, None
 
 
 async def cmd_gym_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
