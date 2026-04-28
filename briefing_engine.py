@@ -576,10 +576,11 @@ def _rename_google_task_fuzzy(needle: str, new_title: str, label: Optional[str])
     return None
 
 
-def append_to_task(partial_title: str, extra_text: str) -> Optional[str]:
+def append_to_task(partial_title: str, extra_text: str) -> Optional[tuple[str, str]]:
     """
-    Fuzzy-match a task and append extra_text to its title.
-    Personal tasks are synced to Google. Returns the new full title, or None if not found.
+    Fuzzy-match an active task and append extra_text to its title.
+    Returns (old_title, new_title) on success, None if not found.
+    Personal tasks are synced to Google.
     """
     needle = partial_title.lower().strip()
     extra_text = extra_text.strip()[:200]
@@ -596,24 +597,30 @@ def append_to_task(partial_title: str, extra_text: str) -> Optional[str]:
             score = 1.0
         else:
             needle_words = needle.split()
-            title_words = title.split()
-            word_score = sum(1 for w in needle_words if w in title) / max(len(needle_words), 1)
+            word_score = sum(
+                1 for w in needle_words
+                if any(tw.startswith(w) or w in tw for tw in title.split())
+            ) / max(len(needle_words), 1)
             seq_score = SequenceMatcher(None, needle, title).ratio()
             score = max(word_score, seq_score)
         if score > best_score:
             best_score = score
             best = t
-    log.info(f"[APPEND_TASK] [MATCH] [needle={needle!r}] [best={best.get('title') if best else None!r}] [score={best_score:.2f}]")
-    if best and best_score >= 0.3:
+    matched_title = best.get("title") if best else None
+    log.info(f"[APPEND_TASK] [needle={needle!r}] [matched={matched_title!r}] [score={best_score:.2f}]")
+    if best and best_score >= 0.2:
         old_title = best["title"]
-        new_title = (old_title + " " + extra_text)[:200]
+        new_title = old_title + " " + extra_text
         is_personal = "personal" in best.get("type", "").lower()
         best["title"] = new_title
         save_tasks(tasks)
         log.info("[APPEND_TASK] [OK]")
         if is_personal:
-            _rename_google_task_fuzzy(old_title, new_title, "Personal")
-        return new_title
+            try:
+                _rename_google_task_fuzzy(old_title, new_title, "Personal")
+            except Exception as exc:
+                log.error(f"[APPEND_TASK] [GOOGLE_SYNC_FAIL] [{type(exc).__name__}]")
+        return old_title, new_title
     return None
 
 

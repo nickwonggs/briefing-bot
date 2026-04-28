@@ -583,13 +583,17 @@ async def cmd_append(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 parse_mode=None,
             )
             return
-        new_title = engine.append_to_task(task_part, extra)
-        if new_title:
-            await update.message.reply_text(f"✏️ Updated: \"{new_title}\"")
+        result = engine.append_to_task(task_part, extra)
+        if result:
+            old_title, new_title = result
+            await update.message.reply_text(
+                f"✏️ Matched: \"{old_title}\"\n→ Updated to: \"{new_title}\"",
+                parse_mode=None,
+            )
             log.info("[CMD_APPEND] [OK]")
         else:
             await update.message.reply_text(
-                f"No task matching \"{task_part}\" found. Check /tasks for names.",
+                f"No task matching \"{task_part}\" found. Use /tasks to see active task names.",
                 parse_mode=None,
             )
     except Exception:
