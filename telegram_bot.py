@@ -237,6 +237,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/add [task] — Add personal task (synced to Google)\n"
         "/add w [task] — Add work task (local only)\n"
         "/update — Update tasks: reschedule or rename\n"
+        "/append [task] + [text] — Append text to a task\n"
         "/weekend — Personal schedule only\n\n"
         "Gym:\n"
         "/days MON WED FRI — Schedule gym days next week\n"
@@ -573,6 +574,43 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(GENERIC_ERROR)
 
 
+async def cmd_append(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/append [task] + [text] — fuzzy-find a task and append text to its title."""
+    if not await _guard(update):
+        return
+    log.info("[CMD_APPEND] [START]")
+    try:
+        raw = _sanitise(update.message.text.partition(" ")[2].strip())
+        if not raw or "+" not in raw:
+            await update.message.reply_text(
+                "Usage: /append [task name] + [text to add]\n"
+                "Example: /append dentist + call to confirm time",
+                parse_mode=None,
+            )
+            return
+        parts = raw.split("+", 1)
+        task_part = parts[0].strip()
+        extra = parts[1].strip()
+        if not task_part or not extra:
+            await update.message.reply_text(
+                "Usage: /append [task name] + [text to add]",
+                parse_mode=None,
+            )
+            return
+        new_title = engine.append_to_task(task_part, extra)
+        if new_title:
+            await update.message.reply_text(f"✏️ Updated: \"{new_title}\"")
+            log.info("[CMD_APPEND] [OK]")
+        else:
+            await update.message.reply_text(
+                f"No task matching \"{task_part}\" found. Check /tasks for names.",
+                parse_mode=None,
+            )
+    except Exception:
+        log.error("[CMD_APPEND] [FAIL]")
+        await update.message.reply_text(GENERIC_ERROR)
+
+
 async def cmd_weekend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update):
         return
@@ -608,7 +646,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /update — dropdown: ✅ Done | 📅 Today | 📅 +1 day\n"
         "  /update old > new — rename a task\n"
         "  /update [task] p0 — change priority (p0–p3)\n"
-        "  /update done [task] — quick mark done\n\n"
+        "  /update done [task] — quick mark done\n"
+        "  /append [task] + [text] — append text to a task title\n\n"
         "/weekend — Personal schedule only\n\n"
         "Gym:\n"
         "  /days MON WED FRI — Schedule gym for those days next week\n"
@@ -782,18 +821,23 @@ def _parse_gym_time(text: str) -> Optional[time]:
 def _parse_gym_datetime(raw: str):
     """
     Parse 'date [time]' from a reschedule arg.
+    Tries last 1-2 tokens as a time, remainder as date.
     Returns (date | None, time | None).
     """
-    # Try to split off a trailing time token
-    forced_time = None
-    date_part = raw.strip()
-    m = re.search(r'\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{1,2}:\d{2})$', raw.strip(), re.IGNORECASE)
-    if m:
-        candidate = _parse_gym_time(m.group(1))
-        if candidate is not None:
-            forced_time = candidate
-            date_part = raw[:m.start()].strip()
-    return _parse_gym_date(date_part), forced_time
+    tokens = raw.strip().split()
+    # Try last 2 tokens as time (e.g. "2:30 pm"), then last 1 token (e.g. "3pm", "14:00")
+    for n in (2, 1):
+        if len(tokens) <= n:
+            continue
+        time_str = " ".join(tokens[-n:])
+        candidate_time = _parse_gym_time(time_str)
+        if candidate_time is not None:
+            date_str = " ".join(tokens[:-n])
+            candidate_date = _parse_gym_date(date_str)
+            if candidate_date is not None:
+                return candidate_date, candidate_time
+    # No time found — parse whole input as date
+    return _parse_gym_date(raw.strip()), None
 
 
 async def cmd_gym_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1098,6 +1142,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("done",    cmd_done))
     app.add_handler(CommandHandler("add",     cmd_add))
     app.add_handler(CommandHandler("update",  cmd_update))
+    app.add_handler(CommandHandler("append",  cmd_append))
     app.add_handler(CommandHandler("weekend",    cmd_weekend))
     app.add_handler(CommandHandler("help",       cmd_help))
 
