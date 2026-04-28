@@ -774,6 +774,8 @@ def _mark_google_task_done(needle: str) -> Optional[str]:
                 body={"status": "completed"},
             ).execute()
             log.info("[GOOGLE_TASK_DONE] [OK]")
+            if best_title:
+                mark_local_task_done_by_title(best_title)
             return best_title
         except Exception:
             log.error("[GOOGLE_TASK_DONE] [PATCH_FAIL]")
