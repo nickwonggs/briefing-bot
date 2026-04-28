@@ -397,11 +397,11 @@ def cascade_skip(skipped_date: date) -> tuple[bool, list[str]]:
         if not future_dates:
             return deleted_today, []
 
-        # ── Step 3: recreate with splits derived from today's split + offset ──
+        # ── Step 3: recreate — today's split carries over to the next session ──
         start_idx = _split_idx(today_split)
         results = []
         for offset, d in enumerate(future_dates):
-            split = SPLIT_ROTATION[(start_idx + 1 + offset) % len(SPLIT_ROTATION)]
+            split = SPLIT_ROTATION[(start_idx + offset) % len(SPLIT_ROTATION)]
             results.append(_direct_create_event(svc, gym_cal_id, d, split))
 
         return deleted_today, results

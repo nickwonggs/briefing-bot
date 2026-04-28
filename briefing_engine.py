@@ -12,6 +12,7 @@ import logging
 import logging.handlers
 import tempfile
 import re
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from typing import Optional
@@ -586,14 +587,21 @@ def append_to_task(partial_title: str, extra_text: str) -> Optional[str]:
         return None
     tasks = load_tasks()
     best = None
-    best_score = 0
+    best_score = 0.0
     for t in tasks:
         title = t.get("title", "").lower()
-        score = len([w for w in needle.split() if w in title])
+        if needle in title:
+            score = 1.0
+        else:
+            needle_words = needle.split()
+            title_words = title.split()
+            word_score = sum(1 for w in needle_words if any(w in tw for tw in title_words)) / max(len(needle_words), 1)
+            seq_score = SequenceMatcher(None, needle, title).ratio()
+            score = max(word_score, seq_score)
         if score > best_score:
             best_score = score
             best = t
-    if best and best_score > 0:
+    if best and best_score >= 0.3:
         old_title = best["title"]
         new_title = (old_title + " " + extra_text)[:200]
         is_personal = "personal" in best.get("type", "").lower()

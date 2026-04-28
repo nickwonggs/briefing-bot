@@ -652,6 +652,20 @@ def _parse_gym_date(text: str) -> Optional[date]:
     if t in ("tomorrow",):
         return today + timedelta(days=1)
 
+    # Weekday names: "friday", "fri", "monday", etc. → next occurrence
+    _WD_NAMES = {
+        "mon": 0, "monday": 0, "tue": 1, "tuesday": 1,
+        "wed": 2, "wednesday": 2, "thu": 3, "thursday": 3,
+        "fri": 4, "friday": 4, "sat": 5, "saturday": 5,
+        "sun": 6, "sunday": 6,
+    }
+    if t in _WD_NAMES:
+        target_wd = _WD_NAMES[t]
+        days_ahead = (target_wd - today.weekday() + 7) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+        return today + timedelta(days=days_ahead)
+
     # YYYY-MM-DD
     try:
         return date.fromisoformat(t)
