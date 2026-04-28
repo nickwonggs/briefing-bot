@@ -532,21 +532,6 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 )
             return
 
-        # ── Append: "task name + extra text" ──────────────────────────────
-        m_append = re.match(r'^(.+?)\s\+\s(.+)$', sanitised)
-        if m_append:
-            task_part = m_append.group(1).strip()
-            extra = m_append.group(2).strip()
-            new_title = engine.append_to_task(task_part, extra)
-            if new_title:
-                await update.message.reply_text(f"✏️ Updated: \"{new_title}\"")
-                log.info("[CMD_UPDATE] [APPEND] [OK]")
-            else:
-                await update.message.reply_text(
-                    f"No task matching \"{task_part}\" found. Check /tasks for names."
-                )
-            return
-
         # ── Quick done shortcut: "done [task name]" ───────────────────────
         if sanitised.lower().startswith("done "):
             task_name = sanitised[5:].strip()
@@ -566,7 +551,8 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "• /update — dropdown to mark done or reschedule\n"
             "• /update old name > new name — rename a task\n"
             "• /update [task] p0 — change priority (p0–p3)\n"
-            "• /update done [task name] — quick mark done"
+            "• /update done [task name] — quick mark done\n"
+            "• /append [task] + [text] — append text to a task title"
         )
 
     except Exception:
@@ -646,8 +632,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /update — dropdown: ✅ Done | 📅 Today | 📅 +1 day\n"
         "  /update old > new — rename a task\n"
         "  /update [task] p0 — change priority (p0–p3)\n"
-        "  /update done [task] — quick mark done\n"
-        "  /append [task] + [text] — append text to a task title\n\n"
+        "  /update done [task] — quick mark done\n\n"
         "/weekend — Personal schedule only\n\n"
         "Gym:\n"
         "  /days MON WED FRI — Schedule gym for those days next week\n"
@@ -656,8 +641,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /next — Show next split without changing state\n"
         "  /reschedule [date] [time] — Schedule on a date/time (e.g. /reschedule 5 may 3pm)\n"
         "  /setsplit [date] [Push/Pull/Legs/Rest] — Change a day's split and cascade\n\n"
-        "Task append:\n"
-        "  /update [task] + [text] — Append text to a task title\n\n"
+        "  /append [task] + [text] — Append text to a task title\n\n"
         "/help — This message",
         parse_mode=None,
     )
