@@ -357,15 +357,17 @@ def _archive_old_done_tasks(tasks: list[dict]) -> list[dict]:
 
 
 def mark_task_done(task_name: str) -> Optional[str]:
-    """Fuzzy match across Google Tasks (both accounts) and local list. Returns matched title."""
+    """
+    Fuzzy match across local store and Google Tasks. Returns matched title.
+    Work tasks are local-only, so local search runs first and wins if confident.
+    Personal tasks prefer Google Tasks as the source of truth.
+    """
     needle = task_name.lower().strip()
-    google_match = _mark_google_task_done(needle)
-    if google_match:
-        return google_match
 
+    # Always score local tasks up front
     tasks = load_tasks()
-    best = None
-    best_score = 0.0
+    local_best = None
+    local_best_score = 0.0
     for t in tasks:
         if t.get("status") == "done":
             continue
@@ -380,17 +382,35 @@ def mark_task_done(task_name: str) -> Optional[str]:
             ) / max(len(needle_words), 1)
             seq_score = SequenceMatcher(None, needle, title).ratio()
             score = max(word_score, seq_score)
-        if score > best_score:
-            best_score = score
-            best = t
+        if score > local_best_score:
+            local_best_score = score
+            local_best = t
 
-    matched_title = best.get("title") if best else None
-    log.info(f"[MARK_DONE_LOCAL] [needle={needle!r}] [matched={matched_title!r}] [score={best_score:.2f}]")
-    if best and best_score >= 0.2:
-        best["status"] = "done"
-        best["done_at"] = datetime.now(TZ).isoformat()
+    matched_title = local_best.get("title") if local_best else None
+    log.info(f"[MARK_DONE_LOCAL] [needle={needle!r}] [matched={matched_title!r}] [score={local_best_score:.2f}]")
+
+    # Work tasks live only in the local store — commit immediately if confident
+    if (local_best and local_best_score >= 0.2
+            and "work" in local_best.get("type", "").lower()):
+        local_best["status"] = "done"
+        local_best["done_at"] = datetime.now(TZ).isoformat()
         save_tasks(tasks)
-        return best.get("title")
+        log.info("[MARK_DONE] [WORK_LOCAL] [OK]")
+        return local_best.get("title")
+
+    # Personal tasks: Google Tasks is the source of truth
+    google_match = _mark_google_task_done(needle)
+    if google_match:
+        return google_match
+
+    # Google miss — fall back to local personal match
+    if local_best and local_best_score >= 0.2:
+        local_best["status"] = "done"
+        local_best["done_at"] = datetime.now(TZ).isoformat()
+        save_tasks(tasks)
+        log.info("[MARK_DONE] [LOCAL_FALLBACK] [OK]")
+        return local_best.get("title")
+
     return None
 
 
@@ -707,6 +727,91 @@ def append_to_task(partial_title: str, extra_text: str) -> Optional[tuple[str, s
     # No local match — search Google Tasks directly (catches tasks added outside the bot)
     log.info(f"[APPEND_TASK] [LOCAL_MISS] [falling_back_to_google]")
     return _append_google_task_fuzzy(needle, extra_text)
+
+
+def mark_work_task_done(task_name: str) -> Optional[str]:
+    """
+    Fuzzy-match an active work task in the local store and mark it done.
+    Never touches Google Tasks — work tasks are local-only.
+    Returns the matched title, or None if not found.
+    """
+    needle = task_name.lower().strip()
+    tasks = load_tasks()
+    best = None
+    best_score = 0.0
+    for t in tasks:
+        if t.get("status") == "done":
+            continue
+        if "work" not in t.get("type", "").lower():
+            continue
+        title = t.get("title", "").lower()
+        if needle in title:
+            score = 1.0
+        else:
+            needle_words = needle.split()
+            word_score = sum(
+                1 for w in needle_words
+                if any(tw.startswith(w) or w in tw for tw in title.split())
+            ) / max(len(needle_words), 1)
+            seq_score = SequenceMatcher(None, needle, title).ratio()
+            score = max(word_score, seq_score)
+        if score > best_score:
+            best_score = score
+            best = t
+
+    matched_title = best.get("title") if best else None
+    log.info(f"[MARK_WORK_DONE] [needle={needle!r}] [matched={matched_title!r}] [score={best_score:.2f}]")
+    if best and best_score >= 0.2:
+        best["status"] = "done"
+        best["done_at"] = datetime.now(TZ).isoformat()
+        save_tasks(tasks)
+        return best.get("title")
+    return None
+
+
+def append_to_work_task(partial_title: str, extra_text: str) -> Optional[tuple[str, str]]:
+    """
+    Fuzzy-match an active work task and append extra_text to its title.
+    Searches local store only (work tasks are never in Google Tasks).
+    Returns (old_title, new_title) on success, None if not found.
+    """
+    needle = partial_title.lower().strip()
+    extra_text = extra_text.strip()[:200]
+    if not extra_text:
+        return None
+    tasks = load_tasks()
+    best = None
+    best_score = 0.0
+    for t in tasks:
+        if t.get("status") == "done":
+            continue
+        if "work" not in t.get("type", "").lower():
+            continue
+        title = t.get("title", "").lower()
+        if needle in title:
+            score = 1.0
+        else:
+            needle_words = needle.split()
+            word_score = sum(
+                1 for w in needle_words
+                if any(tw.startswith(w) or w in tw for tw in title.split())
+            ) / max(len(needle_words), 1)
+            seq_score = SequenceMatcher(None, needle, title).ratio()
+            score = max(word_score, seq_score)
+        if score > best_score:
+            best_score = score
+            best = t
+
+    matched_title = best.get("title") if best else None
+    log.info(f"[APPEND_WORK_TASK] [needle={needle!r}] [matched={matched_title!r}] [score={best_score:.2f}]")
+    if best and best_score >= 0.2:
+        old_title = best["title"]
+        new_title = old_title + " " + extra_text
+        best["title"] = new_title
+        save_tasks(tasks)
+        log.info("[APPEND_WORK_TASK] [OK]")
+        return old_title, new_title
+    return None
 
 
 def rename_google_task_by_id(task_list_id: str, task_id: str, new_title: str, label: str) -> bool:
@@ -1478,8 +1583,11 @@ def _format_task_list(tasks: list[dict], google_tasks: list[dict] = None,
             parts.append(f"🔁 {t['recurrence']}")
         return f" ({', '.join(parts)})" if parts else ""
 
-    # Deduplicate: skip local personal tasks whose title already appears in Google Tasks
-    all_google_personal_titles = {t["title"] for t in google_tasks if t.get("label") == "Personal"}
+    # Deduplicate: only suppress a local personal task if its Google counterpart is
+    # actually being shown in gt_personal (due today / overdue). Future-dated Google
+    # Tasks must NOT hide local entries — they wouldn't appear in gt_personal and the
+    # task would vanish from the list entirely.
+    shown_google_personal_titles = {t["title"] for t in gt_personal}
 
     lines = ["👤 <b>Personal Tasks</b>"]
     if local_personal_done:
@@ -1487,7 +1595,7 @@ def _format_task_list(tasks: list[dict], google_tasks: list[dict] = None,
     if local_personal_overdue:
         lines.append("🔴 Overdue: " + ", ".join(_h(t["title"]) for t in local_personal_overdue))
     for t in local_personal_active:
-        if t["title"] not in all_google_personal_titles:
+        if t["title"] not in shown_google_personal_titles:
             lines.append(f"• {_h(t['title'])}{_task_due_rec(t)}")
     for t in gt_personal:
         due = f" (due {_h(t['due'])})" if t.get("due") else ""

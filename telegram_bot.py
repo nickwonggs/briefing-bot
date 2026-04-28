@@ -12,7 +12,7 @@ Security model:
 /update command:
   /update              → inline keyboard: Done / Today / +1 day per task
   /update old > new    → rename task (personal syncs to Google)
-  /update done [task]  → quick mark-done alias
+  /update [task] p0-3  → set work task priority
 """
 
 import os
@@ -230,22 +230,28 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 Daily Briefing Bot is online.\n\n"
         "Briefing:\n"
-        "/morning — Morning refresh\n"
-        "/evening — Evening prep\n"
-        "/tasks — Current task list\n"
-        "/done — Mark task done (dropdown)\n"
-        "/add [task] — Add personal task (synced to Google)\n"
-        "/add w [task] — Add work task (local only)\n"
-        "/update — Update tasks: reschedule or rename\n"
-        "/append [task] + [text] — Append text to a task\n"
-        "/weekend — Personal schedule only\n\n"
+        "  /morning — Morning refresh\n"
+        "  /evening — Evening prep\n"
+        "  /tasks — Current task list\n"
+        "  /weekend — Personal schedule only\n\n"
+        "Tasks:\n"
+        "  /add [task] — Add personal task (synced to Google)\n"
+        "  /add w [task] [p0-3] — Add work task\n"
+        "  /done — Dropdown: mark any task done\n"
+        "  /done [task] — Mark personal task done\n"
+        "  /done w [task] — Mark work task done\n"
+        "  /append [task] + [text] — Append to personal task\n"
+        "  /append w [task] + [text] — Append to work task\n"
+        "  /update — Dropdown: Done / Today / +1 day\n"
+        "  /update old > new — Rename a task\n"
+        "  /update [task] p0-3 — Set work priority\n\n"
         "Gym:\n"
-        "/days MON WED FRI — Schedule gym days next week\n"
-        "/skip — Skip today, roll split forward\n"
-        "/status — This week's gym sessions\n"
-        "/next — Next split day (no change)\n"
-        "/reschedule [date] [time] — Schedule on a date/time\n"
-        "/setsplit [date] [Push/Pull/Legs/Rest] — Change a day's split\n\n"
+        "  /days MON WED FRI — Schedule gym days next week\n"
+        "  /skip — Skip today, roll split forward\n"
+        "  /status — This week's gym sessions\n"
+        "  /next — Next split day (no change)\n"
+        "  /reschedule [date] [time] — Schedule on a date/time\n"
+        "  /setsplit [date] [Push/Pull/Legs/Rest] — Change a day's split\n\n"
         "/help — Full command list",
         parse_mode=None,
     )
@@ -293,11 +299,38 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /done              — dropdown (personal + work)
+    /done [task]       — fuzzy mark personal task done (Google Tasks first)
+    /done w [task]     — fuzzy mark work task done (local only, no Google search)
+    """
     if not await _guard(update):
         return
     log.info("[CMD_DONE] [START]")
     try:
         args = update.message.text.partition(" ")[2].strip()
+
+        # /done w [task] — work tasks only
+        if args.lower().startswith("w ") and len(args) > 2:
+            task_name = _sanitise(args[2:].strip(), MAX_COMMAND_LEN)
+            if not task_name:
+                await update.message.reply_text(
+                    "Usage: /done w [task name]", parse_mode=None
+                )
+                return
+            matched = engine.mark_work_task_done(task_name)
+            if matched:
+                await update.message.reply_text(f"✅ Marked done: {matched}")
+                log.info("[CMD_DONE] [WORK] [OK]")
+            else:
+                await update.message.reply_text(
+                    f"No work task matching \"{task_name}\" found.\n"
+                    "Use /tasks to see active work tasks.",
+                    parse_mode=None,
+                )
+            return
+
+        # /done — dropdown
         if not args:
             chat_id = update.message.chat_id
             keyboard = _build_done_keyboard(chat_id)
@@ -308,13 +341,18 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             log.info("[CMD_DONE] [DROPDOWN_SHOWN]")
             return
 
+        # /done [task] — personal fuzzy match (Google first, then local)
         task_name = _sanitise(args, MAX_COMMAND_LEN)
         matched = engine.mark_task_done(task_name)
         if matched:
             await update.message.reply_text(f"✅ Marked done: {matched}")
-            log.info("[CMD_DONE] [OK]")
+            log.info("[CMD_DONE] [PERSONAL] [OK]")
         else:
-            await update.message.reply_text("No matching task found. Try /done without args to use the dropdown.")
+            await update.message.reply_text(
+                f"No task matching \"{task_name}\" found.\n"
+                "Try /done for the dropdown, or /done w [task] for work tasks.",
+                parse_mode=None,
+            )
     except Exception:
         log.error("[CMD_DONE] [FAIL]")
         await update.message.reply_text(GENERIC_ERROR)
@@ -461,7 +499,7 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """
     /update              — show dropdown: Done | Today | +1 day per task
     /update old > new    — rename task (personal syncs to Google Tasks)
-    /update done [task]  — quick mark-done shortcut
+    /update [task] p0-3  — set work task priority
     """
     if not await _guard(update):
         return
@@ -532,27 +570,16 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 )
             return
 
-        # ── Quick done shortcut: "done [task name]" ───────────────────────
-        if sanitised.lower().startswith("done "):
-            task_name = sanitised[5:].strip()
-            matched = engine.mark_task_done(task_name)
-            if matched:
-                await update.message.reply_text(f"✅ Marked done: {matched}")
-                log.info("[CMD_UPDATE] [DONE_SHORTCUT] [OK]")
-            else:
-                await update.message.reply_text(
-                    f"No task matching \"{task_name}\" found. Try /done for the dropdown."
-                )
-            return
-
         # ── Unrecognised text ─────────────────────────────────────────────
         await update.message.reply_text(
             "📋 /update options:\n\n"
-            "• /update — dropdown to mark done or reschedule\n"
+            "• /update — dropdown: ✅ Done | 📅 Today | 📅 +1 day\n"
             "• /update old name > new name — rename a task\n"
-            "• /update [task] p0 — change priority (p0–p3)\n"
-            "• /update done [task name] — quick mark done\n"
-            "• /append [task] + [text] — append text to a task title"
+            "• /update [task] p0 — set work priority (p0–p3)\n\n"
+            "To mark a task done by name:\n"
+            "• /done [task] — personal task\n"
+            "• /done w [task] — work task",
+            parse_mode=None,
         )
 
     except Exception:
@@ -561,19 +588,31 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_append(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/append [task] + [text] — fuzzy-find a task and append text to its title."""
+    """
+    /append [task] + [text]     — append to a personal task (Google Tasks + local)
+    /append w [task] + [text]   — append to a work task (local only)
+    """
     if not await _guard(update):
         return
     log.info("[CMD_APPEND] [START]")
     try:
         raw = _sanitise(update.message.text.partition(" ")[2].strip())
+
+        # Detect work prefix
+        work_only = False
+        if raw.lower().startswith("w ") and len(raw) > 2:
+            work_only = True
+            raw = raw[2:].strip()
+
         if not raw or "+" not in raw:
             await update.message.reply_text(
-                "Usage: /append [task name] + [text to add]\n"
-                "Example: /append dentist + call to confirm time",
+                "Usage:\n"
+                "  /append [task] + [text]    — personal task\n"
+                "  /append w [task] + [text]  — work task",
                 parse_mode=None,
             )
             return
+
         parts = raw.split("+", 1)
         task_part = parts[0].strip()
         extra = parts[1].strip()
@@ -583,19 +622,30 @@ async def cmd_append(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 parse_mode=None,
             )
             return
-        result = engine.append_to_task(task_part, extra)
+
+        if work_only:
+            result = engine.append_to_work_task(task_part, extra)
+            not_found = (
+                f"No work task matching \"{task_part}\" found.\n"
+                "Use /tasks to see active work tasks."
+            )
+        else:
+            result = engine.append_to_task(task_part, extra)
+            not_found = (
+                f"No task matching \"{task_part}\" found.\n"
+                "Use /tasks to see active task names."
+            )
+
         if result:
             old_title, new_title = result
+            label = "work" if work_only else "personal"
             await update.message.reply_text(
                 f"✏️ Matched: \"{old_title}\"\n→ Updated to: \"{new_title}\"",
                 parse_mode=None,
             )
-            log.info("[CMD_APPEND] [OK]")
+            log.info(f"[CMD_APPEND] [{label.upper()}] [OK]")
         else:
-            await update.message.reply_text(
-                f"No task matching \"{task_part}\" found. Use /tasks to see active task names.",
-                parse_mode=None,
-            )
+            await update.message.reply_text(not_found, parse_mode=None)
     except Exception:
         log.error("[CMD_APPEND] [FAIL]")
         await update.message.reply_text(GENERIC_ERROR)
@@ -623,7 +673,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/morning — Morning refresh\n"
         "/evening — Evening prep\n"
         "/tasks — Full task list\n"
-        "/done — Mark task done (dropdown)\n\n"
+        "/weekend — Personal schedule only\n\n"
         "Adding tasks:\n"
         "  /add [task] — personal, today\n"
         "  /add [task] on [date] — personal, specific date\n"
@@ -632,20 +682,24 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /add w [task] p1 on [date] — work + priority + date\n"
         "  Dates: tomorrow, friday, 5 may, next week\n"
         "  Freq: daily, weekly, monthly, every 2 weeks\n\n"
+        "Marking done:\n"
+        "  /done — dropdown: pick any task\n"
+        "  /done [task] — personal task (Google Tasks first)\n"
+        "  /done w [task] — work task (local only)\n\n"
+        "Appending to tasks:\n"
+        "  /append [task] + [text] — personal task\n"
+        "  /append w [task] + [text] — work task\n\n"
         "Updating tasks:\n"
         "  /update — dropdown: ✅ Done | 📅 Today | 📅 +1 day\n"
         "  /update old > new — rename a task\n"
-        "  /update [task] p0 — change priority (p0–p3)\n"
-        "  /update done [task] — quick mark done\n\n"
-        "/weekend — Personal schedule only\n\n"
+        "  /update [task] p0 — change priority (p0–p3)\n\n"
         "Gym:\n"
         "  /days MON WED FRI — Schedule gym for those days next week\n"
         "  /skip — Skip today, cascade remaining splits\n"
         "  /status — This week's scheduled gym sessions\n"
         "  /next — Show next split without changing state\n"
-        "  /reschedule [date] [time] — Schedule on a date/time (e.g. /reschedule 5 may 3pm)\n"
-        "  /setsplit [date] [Push/Pull/Legs/Rest] — Change a day's split and cascade\n\n"
-        "  /append [task] + [text] — Append text to a task title\n\n"
+        "  /reschedule [date] [time] — e.g. /reschedule 5 may 3pm\n"
+        "  /setsplit [date] [Push/Pull/Legs/Rest] — Change a day's split\n\n"
         "/help — This message",
         parse_mode=None,
     )
