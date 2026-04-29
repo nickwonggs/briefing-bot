@@ -358,19 +358,27 @@ def _archive_old_done_tasks(tasks: list[dict]) -> list[dict]:
 
 def mark_task_done(task_name: str) -> Optional[str]:
     """
-    Fuzzy match across local store and Google Tasks. Returns matched title.
-    Work tasks are local-only, so local search runs first and wins if confident.
-    Personal tasks prefer Google Tasks as the source of truth.
+    For /done [task] — personal tasks only.
+    Google Tasks is the source of truth: searches Google first, then falls back
+    to the local personal store. Never touches work tasks — use mark_work_task_done().
+    Returns the matched title, or None if not found.
     """
     needle = task_name.lower().strip()
 
-    # Always score local tasks up front
+    # Personal tasks: Google Tasks is the source of truth
+    google_match = _mark_google_task_done(needle)
+    if google_match:
+        return google_match
+
+    # Google miss — fall back to local personal tasks only (never work tasks)
     tasks = load_tasks()
-    local_best = None
-    local_best_score = 0.0
+    best = None
+    best_score = 0.0
     for t in tasks:
         if t.get("status") == "done":
             continue
+        if "personal" not in t.get("type", "").lower():
+            continue  # skip work tasks entirely
         title = t.get("title", "").lower()
         if needle in title:
             score = 1.0
@@ -382,34 +390,19 @@ def mark_task_done(task_name: str) -> Optional[str]:
             ) / max(len(needle_words), 1)
             seq_score = SequenceMatcher(None, needle, title).ratio()
             score = max(word_score, seq_score)
-        if score > local_best_score:
-            local_best_score = score
-            local_best = t
+        if score > best_score:
+            best_score = score
+            best = t
 
-    matched_title = local_best.get("title") if local_best else None
-    log.info(f"[MARK_DONE_LOCAL] [needle={needle!r}] [matched={matched_title!r}] [score={local_best_score:.2f}]")
+    matched_title = best.get("title") if best else None
+    log.info(f"[MARK_DONE_LOCAL_PERSONAL] [needle={needle!r}] [matched={matched_title!r}] [score={best_score:.2f}]")
 
-    # Work tasks live only in the local store — commit immediately if confident
-    if (local_best and local_best_score >= 0.2
-            and "work" in local_best.get("type", "").lower()):
-        local_best["status"] = "done"
-        local_best["done_at"] = datetime.now(TZ).isoformat()
+    if best and best_score >= 0.2:
+        best["status"] = "done"
+        best["done_at"] = datetime.now(TZ).isoformat()
         save_tasks(tasks)
-        log.info("[MARK_DONE] [WORK_LOCAL] [OK]")
-        return local_best.get("title")
-
-    # Personal tasks: Google Tasks is the source of truth
-    google_match = _mark_google_task_done(needle)
-    if google_match:
-        return google_match
-
-    # Google miss — fall back to local personal match
-    if local_best and local_best_score >= 0.2:
-        local_best["status"] = "done"
-        local_best["done_at"] = datetime.now(TZ).isoformat()
-        save_tasks(tasks)
-        log.info("[MARK_DONE] [LOCAL_FALLBACK] [OK]")
-        return local_best.get("title")
+        log.info("[MARK_DONE] [LOCAL_PERSONAL_FALLBACK] [OK]")
+        return best.get("title")
 
     return None
 
@@ -680,9 +673,10 @@ def _append_google_task_fuzzy(needle: str, extra_text: str) -> Optional[tuple[st
 
 def append_to_task(partial_title: str, extra_text: str) -> Optional[tuple[str, str]]:
     """
-    Fuzzy-match an active task and append extra_text to its title.
+    For /append [task] + [text] — personal tasks only.
+    Fuzzy-match an active personal task and append extra_text to its title.
     Returns (old_title, new_title) on success, None if not found.
-    Personal tasks are synced to Google.
+    Personal tasks are synced to Google. Never touches work tasks — use append_to_work_task().
     """
     needle = partial_title.lower().strip()
     extra_text = extra_text.strip()[:200]
@@ -694,6 +688,8 @@ def append_to_task(partial_title: str, extra_text: str) -> Optional[tuple[str, s
     for t in tasks:
         if t.get("status") == "done":
             continue
+        if "personal" not in t.get("type", "").lower():
+            continue  # skip work tasks entirely
         title = t.get("title", "").lower()
         if needle in title:
             score = 1.0

@@ -301,8 +301,8 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /done              — dropdown (personal + work)
-    /done [task]       — fuzzy mark personal task done (Google Tasks first)
-    /done w [task]     — fuzzy mark work task done (local only, no Google search)
+    /done [task]       — personal tasks only: Google Tasks first, local personal fallback
+    /done w [task]     — work tasks only: local store, no Google search
     """
     if not await _guard(update):
         return
