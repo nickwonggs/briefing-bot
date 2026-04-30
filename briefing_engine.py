@@ -603,10 +603,11 @@ def _rename_google_task_fuzzy(needle: str, new_title: str, label: Optional[str])
     return None
 
 
-def _append_google_task_fuzzy(needle: str, extra_text: str) -> Optional[tuple[str, str]]:
+def _append_google_task_fuzzy(needle: str, extra_text: str, label: Optional[str] = None) -> Optional[tuple[str, str]]:
     """
-    Search Google Tasks across both accounts, find the best fuzzy match for needle,
-    and append extra_text to its title. Returns (old_title, new_title) or None.
+    Search Google Tasks for needle and append extra_text to the best match title.
+    label='Personal' restricts to personal account only; None searches both.
+    Returns (old_title, new_title) or None.
     """
     best_title = None
     best_score = 0.0
@@ -644,17 +645,18 @@ def _append_google_task_fuzzy(needle: str, extra_text: str) -> Optional[tuple[st
             pass
 
     personal_creds = _build_personal_credentials()
-    if personal_creds:
+    if personal_creds and label in (None, "Personal"):
         try:
             _search(build("tasks", "v1", credentials=personal_creds))
         except Exception:
             pass
-    try:
-        _search(build("tasks", "v1", credentials=_build_credentials()))
-    except Exception:
-        pass
+    if label in (None, "Work"):
+        try:
+            _search(build("tasks", "v1", credentials=_build_credentials()))
+        except Exception:
+            pass
 
-    log.info(f"[APPEND_GOOGLE_TASK] [needle={needle!r}] [matched={best_title!r}] [score={best_score:.2f}]")
+    log.info(f"[APPEND_GOOGLE_TASK] [needle={needle!r}] [matched={best_title!r}] [score={best_score:.2f}] [label={label!r}]")
     if best_score >= 0.2 and best_task_id and best_service:
         old_title = best_title
         new_title = old_title + " " + extra_text
@@ -720,9 +722,9 @@ def append_to_task(partial_title: str, extra_text: str) -> Optional[tuple[str, s
                 log.error(f"[APPEND_TASK] [GOOGLE_SYNC_FAIL] [{type(exc).__name__}]")
         return old_title, new_title
 
-    # No local match — search Google Tasks directly (catches tasks added outside the bot)
+    # No local match — search personal Google Tasks only (catches tasks added outside the bot)
     log.info(f"[APPEND_TASK] [LOCAL_MISS] [falling_back_to_google]")
-    return _append_google_task_fuzzy(needle, extra_text)
+    return _append_google_task_fuzzy(needle, extra_text, label="Personal")
 
 
 def mark_work_task_done(task_name: str) -> Optional[str]:
@@ -1547,9 +1549,22 @@ def _format_task_list(tasks: list[dict], google_tasks: list[dict] = None,
                              if "personal" in t.get("type", "").lower()
                              and t.get("status") == "in_progress"
                              and not t.get("auto_generated")]
-    local_personal_done = [t for t in tasks
-                           if "personal" in t.get("type", "").lower()
-                           and t.get("status") == "done"]
+    _12h_ago = datetime.now(TZ) - timedelta(hours=12)
+    local_personal_done = []
+    for _t in tasks:
+        if "personal" not in _t.get("type", "").lower() or _t.get("status") != "done":
+            continue
+        _done_at = _t.get("done_at")
+        if not _done_at:
+            continue
+        try:
+            _dt = datetime.fromisoformat(_done_at)
+            if _dt.tzinfo is None:
+                _dt = _dt.replace(tzinfo=TZ)
+            if _dt > _12h_ago:
+                local_personal_done.append(_t)
+        except (ValueError, TypeError):
+            pass
     local_personal_overdue = [t for t in tasks
                               if "personal" in t.get("type", "").lower()
                               and t.get("status") == "overdue"]
