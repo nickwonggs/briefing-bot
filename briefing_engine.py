@@ -974,6 +974,17 @@ def _is_due_today_or_overdue(task: dict) -> bool:
     return due_dt.astimezone(TZ).date() == datetime.now(TZ).date()
 
 
+def _local_task_due_today_or_earlier(t: dict) -> bool:
+    """True if a local task has no due_date (undated) or due_date <= today (SGT)."""
+    dd = t.get("due_date")
+    if not dd:
+        return True
+    try:
+        return date.fromisoformat(dd) <= datetime.now(TZ).date()
+    except (ValueError, TypeError):
+        return True
+
+
 def _fetch_tasks_for_service(service, label: str) -> list[dict]:
     """Fetch incomplete tasks from one Tasks API service instance."""
     results = []
@@ -1548,7 +1559,8 @@ def _format_task_list(tasks: list[dict], google_tasks: list[dict] = None,
     local_personal_active = [t for t in tasks
                              if "personal" in t.get("type", "").lower()
                              and t.get("status") == "in_progress"
-                             and not t.get("auto_generated")]
+                             and not t.get("auto_generated")
+                             and _local_task_due_today_or_earlier(t)]
     _12h_ago = datetime.now(TZ) - timedelta(hours=12)
     local_personal_done = []
     for _t in tasks:
@@ -1656,7 +1668,8 @@ def _top_priorities_split(tasks: list[dict], google_tasks: list[dict],
     personal_local = [t for t in tasks
                       if "personal" in t.get("type", "").lower()
                       and t.get("status") in ("overdue", "in_progress")
-                      and not t.get("auto_generated")]
+                      and not t.get("auto_generated")
+                      and (t.get("status") == "overdue" or _local_task_due_today_or_earlier(t))]
 
     def _pick3(candidates, show_priority: bool = False, show_type: bool = False):
         seen: set[str] = set()
