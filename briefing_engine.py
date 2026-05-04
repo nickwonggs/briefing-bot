@@ -1271,9 +1271,13 @@ def fetch_emails(since_hours: int = 24) -> dict:
                 "is_unread": bool, "is_sent": bool, "age_hours": float}
     """
     log.info("[FETCH_EMAILS] [START]")
-    creds = _build_credentials()
-    service = build("gmail", "v1", credentials=creds)
-    _validate_account(service)
+    try:
+        creds = _build_credentials()
+        service = build("gmail", "v1", credentials=creds)
+        _validate_account(service)
+    except Exception as exc:
+        log.error(f"[FETCH_EMAILS] [AUTH_FAIL] [{type(exc).__name__}] {exc}")
+        return {"urgent": [], "normal": [], "deferred_count": 0}
 
     cutoff = datetime.now(TZ) - timedelta(hours=since_hours)
     query = f"after:{int(cutoff.timestamp())}"

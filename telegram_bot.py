@@ -147,8 +147,8 @@ def _build_done_keyboard(chat_id: int) -> Optional[InlineKeyboardMarkup]:
     try:
         tasks = engine.get_tasks_for_dropdown()
         _task_dropdown_cache[chat_id] = tasks
-    except Exception:
-        log.error("[DONE_KEYBOARD] [FETCH_FAIL]")
+    except Exception as exc:
+        log.error(f"[DONE_KEYBOARD] [FETCH_FAIL] [{type(exc).__name__}] {exc}")
         return None
 
     personal = tasks.get("personal", [])
@@ -181,8 +181,8 @@ def _build_update_keyboard(chat_id: int) -> Optional[InlineKeyboardMarkup]:
     try:
         tasks = engine.get_tasks_for_dropdown()
         _update_dropdown_cache[chat_id] = tasks
-    except Exception:
-        log.error("[UPDATE_KEYBOARD] [FETCH_FAIL]")
+    except Exception as exc:
+        log.error(f"[UPDATE_KEYBOARD] [FETCH_FAIL] [{type(exc).__name__}] {exc}")
         return None
 
     personal = tasks.get("personal", [])
@@ -265,8 +265,8 @@ async def cmd_morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         briefing = engine.build_morning_briefing()
         await update.message.reply_text(briefing, parse_mode="HTML")
         log.info("[CMD_MORNING] [OK]")
-    except Exception:
-        log.error("[CMD_MORNING] [FAIL]")
+    except Exception as exc:
+        log.error(f"[CMD_MORNING] [FAIL] [{type(exc).__name__}] {exc}")
         await update.message.reply_text(GENERIC_ERROR)
 
 
@@ -279,8 +279,8 @@ async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         briefing = engine.build_evening_briefing(target)
         await update.message.reply_text(briefing, parse_mode="HTML")
         log.info("[CMD_EVENING] [OK]")
-    except Exception:
-        log.error("[CMD_EVENING] [FAIL]")
+    except Exception as exc:
+        log.error(f"[CMD_EVENING] [FAIL] [{type(exc).__name__}] {exc}")
         await update.message.reply_text(GENERIC_ERROR)
 
 
@@ -293,8 +293,8 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = engine.get_task_list_text(weekend=(today_wd >= 5))
         await update.message.reply_text(text, parse_mode="HTML")
         log.info("[CMD_TASKS] [OK]")
-    except Exception:
-        log.error("[CMD_TASKS] [FAIL]")
+    except Exception as exc:
+        log.error(f"[CMD_TASKS] [FAIL] [{type(exc).__name__}] {exc}")
         await update.message.reply_text(GENERIC_ERROR)
 
 
@@ -353,8 +353,8 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Try /done for the dropdown, or /done w [task] for work tasks.",
                 parse_mode=None,
             )
-    except Exception:
-        log.error("[CMD_DONE] [FAIL]")
+    except Exception as exc:
+        log.error(f"[CMD_DONE] [FAIL] [{type(exc).__name__}] {exc}")
         await update.message.reply_text(GENERIC_ERROR)
 
 
@@ -490,8 +490,8 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             log.info(f"[CMD_ADD] [PERSONAL] [RECURRING={bool(rrule)}] [OK]")
 
-    except Exception:
-        log.error("[CMD_ADD] [FAIL]")
+    except Exception as exc:
+        log.error(f"[CMD_ADD] [FAIL] [{type(exc).__name__}] {exc}")
         await update.message.reply_text(GENERIC_ERROR)
 
 
@@ -582,8 +582,8 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             parse_mode=None,
         )
 
-    except Exception:
-        log.error("[CMD_UPDATE] [FAIL]")
+    except Exception as exc:
+        log.error(f"[CMD_UPDATE] [FAIL] [{type(exc).__name__}] {exc}")
         await update.message.reply_text(GENERIC_ERROR)
 
 
@@ -646,8 +646,8 @@ async def cmd_append(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             log.info(f"[CMD_APPEND] [{label.upper()}] [OK]")
         else:
             await update.message.reply_text(not_found, parse_mode=None)
-    except Exception:
-        log.error("[CMD_APPEND] [FAIL]")
+    except Exception as exc:
+        log.error(f"[CMD_APPEND] [FAIL] [{type(exc).__name__}] {exc}")
         await update.message.reply_text(GENERIC_ERROR)
 
 
@@ -659,8 +659,8 @@ async def cmd_weekend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         briefing = engine.build_weekend_briefing()
         await update.message.reply_text(briefing, parse_mode="HTML")
         log.info("[CMD_WEEKEND] [OK]")
-    except Exception:
-        log.error("[CMD_WEEKEND] [FAIL]")
+    except Exception as exc:
+        log.error(f"[CMD_WEEKEND] [FAIL] [{type(exc).__name__}] {exc}")
         await update.message.reply_text(GENERIC_ERROR)
 
 
@@ -790,8 +790,8 @@ async def cmd_gym_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             reply += "\nNo other sessions this week to update."
         await update.message.reply_text(reply, parse_mode=None)
         log.info("[CMD_GYM_SKIP] [OK]")
-    except Exception:
-        log.error("[CMD_GYM_SKIP] [FAIL]")
+    except Exception as exc:
+        log.error(f"[CMD_GYM_SKIP] [FAIL] [{type(exc).__name__}] {exc}")
         await update.message.reply_text(GENERIC_ERROR)
 
 
@@ -816,8 +816,8 @@ async def cmd_gym_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         lines.append(f"\nCurrent split: {current} Day")
         await update.message.reply_text("\n".join(lines), parse_mode=None)
         log.info("[CMD_GYM_STATUS] [OK]")
-    except Exception:
-        log.error("[CMD_GYM_STATUS] [FAIL]")
+    except Exception as exc:
+        log.error(f"[CMD_GYM_STATUS] [FAIL] [{type(exc).__name__}] {exc}")
         await update.message.reply_text(GENERIC_ERROR)
 
 
@@ -832,8 +832,8 @@ async def cmd_gym_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"Current: {current} Day\nNext up: {nxt} Day",
             parse_mode=None,
         )
-    except Exception:
-        log.error("[CMD_GYM_NEXT] [FAIL]")
+    except Exception as exc:
+        log.error(f"[CMD_GYM_NEXT] [FAIL] [{type(exc).__name__}] {exc}")
         await update.message.reply_text(GENERIC_ERROR)
 
 
@@ -918,8 +918,8 @@ async def cmd_gym_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             await update.message.reply_text("Something went wrong. Check Railway logs.")
         log.info("[CMD_GYM_RESCHEDULE] [OK]")
-    except Exception:
-        log.error("[CMD_GYM_RESCHEDULE] [FAIL]")
+    except Exception as exc:
+        log.error(f"[CMD_GYM_RESCHEDULE] [FAIL] [{type(exc).__name__}] {exc}")
         await update.message.reply_text(GENERIC_ERROR)
 
 
@@ -968,8 +968,8 @@ async def cmd_gym_setsplit(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         results = gym.setsplit_and_cascade(target, new_split)
         await update.message.reply_text("\n".join(results) if results else "Done.", parse_mode=None)
         log.info(f"[CMD_GYM_SETSPLIT] [{new_split}] [OK]")
-    except Exception:
-        log.error("[CMD_GYM_SETSPLIT] [FAIL]")
+    except Exception as exc:
+        log.error(f"[CMD_GYM_SETSPLIT] [FAIL] [{type(exc).__name__}] {exc}")
         await update.message.reply_text(GENERIC_ERROR)
 
 
@@ -1022,8 +1022,8 @@ async def cmd_gym_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         await update.message.reply_text("\n".join(results), parse_mode=None)
         log.info(f"[CMD_GYM_DAYS] [OK] [{len(weekday_nums)}_DAYS]")
-    except Exception:
-        log.error("[CMD_GYM_DAYS] [FAIL]")
+    except Exception as exc:
+        log.error(f"[CMD_GYM_DAYS] [FAIL] [{type(exc).__name__}] {exc}")
         await update.message.reply_text(GENERIC_ERROR)
 
 
@@ -1227,5 +1227,5 @@ async def send_message(text: str) -> None:
                 parse_mode="HTML",
             )
         log.info("[SEND_MESSAGE] [OK]")
-    except Exception:
-        log.error("[SEND_MESSAGE] [FAIL]")
+    except Exception as exc:
+        log.error(f"[SEND_MESSAGE] [FAIL] [{type(exc).__name__}] {exc}")
