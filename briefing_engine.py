@@ -1371,98 +1371,121 @@ def _is_whitelisted_calendar(cal_name: str, cal_id: str) -> bool:
     return any(k in lower for k in CALENDAR_WHITELIST_KEYWORDS)
 
 
+def _parse_cal_events(
+    service,
+    cal_id: str,
+    cal_name: str,
+    time_min: str,
+    time_max: str,
+) -> list[dict]:
+    """Fetch and parse events from a single calendar. Returns [] on failure."""
+    tag = _tag_calendar(cal_name, cal_id)
+    try:
+        ev_result = service.events().list(
+            calendarId=cal_id,
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime",
+        ).execute()
+    except Exception as exc:
+        log.error(f"[FETCH_CALENDAR] [EVENTS_FAIL] [{cal_name}] [{type(exc).__name__}]")
+        return []
+
+    out = []
+    for ev in ev_result.get("items", []):
+        title = ev.get("summary", "").strip()
+        if not title:
+            continue
+        declined = any(
+            a.get("self") and a.get("responseStatus") == "declined"
+            for a in ev.get("attendees", [])
+        )
+        if declined:
+            continue
+
+        start = ev.get("start", {})
+        end = ev.get("end", {})
+        all_day = "date" in start and "dateTime" not in start
+
+        if all_day:
+            time_str = "All day"
+            start_dt_obj = None
+            end_dt_obj = None
+        else:
+            start_dt_obj = datetime.fromisoformat(start.get("dateTime", "")).astimezone(TZ)
+            time_str = start_dt_obj.strftime("%I:%M %p")
+            end_str = end.get("dateTime", "")
+            end_dt_obj = (
+                datetime.fromisoformat(end_str).astimezone(TZ)
+                if end_str else start_dt_obj + timedelta(hours=1)
+            )
+
+        out.append({
+            "time": time_str,
+            "title": title,
+            "calendar": cal_name,
+            "tag": tag,
+            "all_day": all_day,
+            "start_dt": start_dt_obj,
+            "end_dt": end_dt_obj,
+            "description": (ev.get("description") or "").strip(),
+            "attachments": ev.get("attachments") or [],
+        })
+    return out
+
+
 def fetch_calendar_events(target_date: date, is_weekend: bool) -> list[dict]:
     """
     Returns sorted list of events for target_date from whitelisted calendars only.
     is_weekend=True → Work calendar skipped entirely at API level.
-    Each event: {time, title, calendar, tag, all_day, start_dt, end_dt, description, attachments}
+
+    Work calendar is fetched with work credentials (nickwys@sph.com.sg).
+    Personal calendars (Gym, Personal, Others, Ryan Chia, Vacation) are fetched
+    directly from wongnicholas98@gmail.com using personal credentials, so they
+    are never dependent on calendar sharing with the work account.
     """
     log.info("[FETCH_CALENDAR] [START]")
-    creds = _build_credentials()
-    service = build("calendar", "v3", credentials=creds)
 
     start_dt = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=TZ)
     end_dt = start_dt + timedelta(days=1)
     time_min = start_dt.isoformat()
     time_max = end_dt.isoformat()
 
-    try:
-        cal_list = service.calendarList().list().execute()
-        calendars = cal_list.get("items", [])
-    except Exception:
-        log.error("[FETCH_CALENDAR] [CAL_LIST_FAIL]")
-        return []
-
     events = []
-    for cal in calendars:
-        cal_name = cal.get("summary", "")
-        cal_id = cal.get("id", "")
 
-        if not _is_whitelisted_calendar(cal_name, cal_id):
-            continue
-
-        if is_weekend and cal_id.lower() == REQUIRED_ACCOUNT.lower():
-            log.info("[FETCH_CALENDAR] [SKIP_WORK_WEEKEND]")
-            continue
-
-        tag = _tag_calendar(cal_name, cal_id)
-
+    # ── Work calendar ──────────────────────────────────────────────────────────
+    if not is_weekend:
         try:
-            ev_result = service.events().list(
-                calendarId=cal_id,
-                timeMin=time_min,
-                timeMax=time_max,
-                singleEvents=True,
-                orderBy="startTime",
-            ).execute()
-            ev_items = ev_result.get("items", [])
-        except Exception:
-            log.error("[FETCH_CALENDAR] [EVENTS_FAIL]")
-            continue
+            work_service = build("calendar", "v3", credentials=_build_credentials())
+            events.extend(_parse_cal_events(
+                work_service, REQUIRED_ACCOUNT, REQUIRED_ACCOUNT, time_min, time_max,
+            ))
+        except Exception as exc:
+            log.error(f"[FETCH_CALENDAR] [WORK_FAIL] [{type(exc).__name__}]")
+    else:
+        log.info("[FETCH_CALENDAR] [SKIP_WORK_WEEKEND]")
 
-        for ev in ev_items:
-            title = ev.get("summary", "").strip()
-            if not title:
+    # ── Personal calendars (wongnicholas98@gmail.com) ──────────────────────────
+    personal_creds = _build_personal_credentials()
+    if personal_creds:
+        try:
+            personal_service = build("calendar", "v3", credentials=personal_creds)
+            cal_list = personal_service.calendarList().list().execute()
+        except Exception as exc:
+            log.error(f"[FETCH_CALENDAR] [PERSONAL_CAL_LIST_FAIL] [{type(exc).__name__}]")
+            cal_list = {}
+
+        for cal in cal_list.get("items", []):
+            cal_name = cal.get("summary", "")
+            cal_id = cal.get("id", "")
+            if not _is_personal_calendar(cal_name):
                 continue
-
-            declined = any(
-                a.get("self") and a.get("responseStatus") == "declined"
-                for a in ev.get("attendees", [])
-            )
-            if declined:
-                continue
-
-            start = ev.get("start", {})
-            end = ev.get("end", {})
-            all_day = "date" in start and "dateTime" not in start
-
-            if all_day:
-                time_str = "All day"
-                start_dt_obj = None
-                end_dt_obj = None
-            else:
-                start_dt_obj = datetime.fromisoformat(start.get("dateTime", "")).astimezone(TZ)
-                time_str = start_dt_obj.strftime("%I:%M %p")
-                end_str = end.get("dateTime", "")
-                end_dt_obj = (
-                    datetime.fromisoformat(end_str).astimezone(TZ)
-                    if end_str else start_dt_obj + timedelta(hours=1)
-                )
-
-            description = (ev.get("description") or "").strip()
-            attachments = ev.get("attachments") or []
-
-            events.append({
-                "time": time_str,
-                "title": title,
-                "calendar": cal_name,
-                "tag": tag,
-                "all_day": all_day,
-                "start_dt": start_dt_obj,
-                "end_dt": end_dt_obj,
-                "description": description,
-                "attachments": attachments,
-            })
+            events.extend(_parse_cal_events(
+                personal_service, cal_id, cal_name, time_min, time_max,
+            ))
+    else:
+        log.warning("[FETCH_CALENDAR] [PERSONAL_CREDS_UNAVAILABLE]")
 
     events.sort(key=lambda e: (
         e["start_dt"] is not None,
