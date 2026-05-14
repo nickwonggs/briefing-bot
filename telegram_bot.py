@@ -1009,14 +1009,12 @@ async def cmd_gym_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         weekday_nums.sort()
 
-        today = date.today()
-        # Next Monday (always schedule for NEXT week, not current week)
-        days_to_monday = (7 - today.weekday()) % 7 or 7
-        next_monday = today + timedelta(days=days_to_monday)
+        tomorrow = date.today() + timedelta(days=1)
 
         results = []
         for wd in weekday_nums:
-            target = next_monday + timedelta(days=wd)
+            days_ahead = (wd - tomorrow.weekday()) % 7
+            target = tomorrow + timedelta(days=days_ahead)
             ok, msg = gym.schedule_gym_session(target)
             results.append(msg)
 
