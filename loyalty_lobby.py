@@ -9,7 +9,6 @@ to Telegram. Priority tags: ACCOR and SQ.
 import asyncio
 import logging
 import os
-import re
 
 import feedparser
 import pytz
