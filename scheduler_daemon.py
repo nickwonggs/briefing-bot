@@ -43,6 +43,7 @@ from zoneinfo import ZoneInfo
 # Project imports (run after logging is configured)
 import briefing_engine as engine
 import gym_engine as gym
+import loyalty_lobby
 import telegram_bot as tbot
 
 load_dotenv()
@@ -94,6 +95,15 @@ def _run_morning_briefing() -> None:
         log.error(f"[SCHEDULED_MORNING] [FAIL] [{type(exc).__name__}]")
 
 
+def _run_loyalty_lobby_digest() -> None:
+    log.info("[SCHEDULED_LOYALTY_LOBBY] [START]")
+    try:
+        loyalty_lobby.send_digest()
+        log.info("[SCHEDULED_LOYALTY_LOBBY] [OK]")
+    except Exception as exc:
+        log.error(f"[SCHEDULED_LOYALTY_LOBBY] [FAIL] [{type(exc).__name__}]")
+
+
 def _run_gym_checkin() -> None:
     log.info("[SCHEDULED_GYM_CHECKIN] [START]")
     try:
@@ -115,9 +125,10 @@ def _setup_schedules() -> None:
     # Times in Singapore time (SGT = UTC+8)
     # schedule library uses datetime.now() which respects the TZ env var
     schedule.every().day.at("08:00").do(_run_morning_briefing)
+    schedule.every().day.at("15:00").do(_run_loyalty_lobby_digest)
     schedule.every().day.at("19:00").do(_run_evening_briefing)
     schedule.every().friday.at("20:00").do(_run_gym_checkin)
-    log.info("[SCHEDULES_REGISTERED] [08:00_MORNING] [19:00_EVENING] [FRI_20:00_GYM_CHECKIN]")
+    log.info("[SCHEDULES_REGISTERED] [08:00_MORNING] [15:00_LOYALTY_LOBBY] [19:00_EVENING] [FRI_20:00_GYM_CHECKIN]")
 
 
 def _run_schedule_loop() -> None:
