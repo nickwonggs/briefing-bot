@@ -38,6 +38,7 @@ SCOPES = [
 PERSONAL_TASKS_SCOPES = [
     "https://www.googleapis.com/auth/tasks",
     "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/drive.file",
 ]
 REQUIRED_ACCOUNT = "nickwys@sph.com.sg"
 _DATA_DIR = os.getenv("TASK_DATA_DIR", ".")
@@ -337,6 +338,74 @@ def save_tasks(tasks: list[dict]) -> None:
         log.info("[SAVE_TASKS] [OK]")
     except Exception:
         log.error("[SAVE_TASKS] [FAIL]")
+
+
+DRIVE_BACKUP_FILENAME = "briefing-bot-task-state.enc"
+
+
+def backup_task_state_to_drive() -> bool:
+    """Upload task_state.json.enc to Google Drive (personal account) before shutdown."""
+    if not os.path.exists(TASK_FILE):
+        log.info("[DRIVE_BACKUP] [NO_LOCAL_FILE] [SKIP]")
+        return False
+    creds = _build_personal_credentials()
+    if not creds:
+        log.error("[DRIVE_BACKUP] [NO_CREDS]")
+        return False
+    try:
+        from googleapiclient.http import MediaFileUpload
+        service = build("drive", "v3", credentials=creds)
+        existing = service.files().list(
+            q=f"name='{DRIVE_BACKUP_FILENAME}' and trashed=false",
+            spaces="drive",
+            fields="files(id)",
+        ).execute().get("files", [])
+        media = MediaFileUpload(TASK_FILE, mimetype="application/octet-stream")
+        if existing:
+            service.files().update(fileId=existing[0]["id"], media_body=media).execute()
+        else:
+            service.files().create(
+                body={"name": DRIVE_BACKUP_FILENAME}, media_body=media
+            ).execute()
+        log.info("[DRIVE_BACKUP] [OK]")
+        return True
+    except Exception as exc:
+        log.error(f"[DRIVE_BACKUP] [FAIL] [{type(exc).__name__}]")
+        return False
+
+
+def restore_task_state_from_drive() -> bool:
+    """Download task_state.json.enc from Google Drive on startup."""
+    creds = _build_personal_credentials()
+    if not creds:
+        log.info("[DRIVE_RESTORE] [NO_CREDS] [SKIP]")
+        return False
+    try:
+        import io
+        from googleapiclient.http import MediaIoBaseDownload
+        service = build("drive", "v3", credentials=creds)
+        existing = service.files().list(
+            q=f"name='{DRIVE_BACKUP_FILENAME}' and trashed=false",
+            spaces="drive",
+            fields="files(id)",
+        ).execute().get("files", [])
+        if not existing:
+            log.info("[DRIVE_RESTORE] [NOT_FOUND] [STARTING_FRESH]")
+            return False
+        request = service.files().get_media(fileId=existing[0]["id"])
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        os.makedirs(os.path.dirname(os.path.abspath(TASK_FILE)), exist_ok=True)
+        with open(TASK_FILE, "wb") as fh:
+            fh.write(buf.getvalue())
+        log.info("[DRIVE_RESTORE] [OK]")
+        return True
+    except Exception as exc:
+        log.error(f"[DRIVE_RESTORE] [FAIL] [{type(exc).__name__}]")
+        return False
 
 
 def _archive_old_done_tasks(tasks: list[dict]) -> list[dict]:

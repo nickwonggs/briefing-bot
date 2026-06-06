@@ -124,6 +124,8 @@ def _run_gym_checkin() -> None:
 def _run_midnight_shutdown() -> None:
     """Clean exit at midnight SGT so Railway (ON_FAILURE policy) won't restart.
     GitHub Actions cron restarts the service at 08:00 SGT — saves ~248 hrs/month."""
+    log.info("[SCHEDULED_SHUTDOWN] [MIDNIGHT] [BACKUP_START]")
+    engine.backup_task_state_to_drive()
     log.info("[SCHEDULED_SHUTDOWN] [MIDNIGHT] [SENDING_SIGTERM]")
     os.kill(os.getpid(), signal.SIGTERM)
 
@@ -158,6 +160,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, _shutdown)
 
     log.info("[DAEMON_START] [OK]")
+    engine.restore_task_state_from_drive()
 
     _start_health_server(port=int(os.getenv("PORT", "8080")))
     _setup_schedules()
