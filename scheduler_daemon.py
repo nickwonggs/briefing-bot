@@ -121,6 +121,13 @@ def _run_gym_checkin() -> None:
         log.error(f"[SCHEDULED_GYM_CHECKIN] [FAIL] [{type(exc).__name__}]")
 
 
+def _run_midnight_shutdown() -> None:
+    """Clean exit at midnight SGT so Railway (ON_FAILURE policy) won't restart.
+    GitHub Actions cron restarts the service at 08:00 SGT — saves ~248 hrs/month."""
+    log.info("[SCHEDULED_SHUTDOWN] [MIDNIGHT] [SENDING_SIGTERM]")
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
 def _setup_schedules() -> None:
     # Times in Singapore time (SGT = UTC+8)
     # schedule library uses datetime.now() which respects the TZ env var
@@ -128,7 +135,8 @@ def _setup_schedules() -> None:
     schedule.every().day.at("15:00").do(_run_loyalty_lobby_digest)
     schedule.every().day.at("19:00").do(_run_evening_briefing)
     schedule.every().friday.at("20:00").do(_run_gym_checkin)
-    log.info("[SCHEDULES_REGISTERED] [08:00_MORNING] [15:00_LOYALTY_LOBBY] [19:00_EVENING] [FRI_20:00_GYM_CHECKIN]")
+    schedule.every().day.at("00:00").do(_run_midnight_shutdown)
+    log.info("[SCHEDULES_REGISTERED] [08:00_MORNING] [15:00_LOYALTY_LOBBY] [19:00_EVENING] [FRI_20:00_GYM_CHECKIN] [00:00_SHUTDOWN]")
 
 
 def _run_schedule_loop() -> None:

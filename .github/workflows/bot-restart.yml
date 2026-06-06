@@ -1,0 +1,22 @@
+name: Restart Bot at 8am SGT
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # 00:00 UTC = 08:00 SGT
+  workflow_dispatch:       # allow manual trigger from GitHub UI
+
+jobs:
+  restart:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Redeploy Railway service
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+          ENVIRONMENT_ID: ${{ secrets.RAILWAY_ENVIRONMENT_ID }}
+        run: |
+          curl -sf -X POST https://backboard.railway.app/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"query\":\"mutation { serviceInstanceRedeploy(serviceId: \\\"$SERVICE_ID\\\", environmentId: \\\"$ENVIRONMENT_ID\\\") }\"}" \
+            | tee /dev/stderr | grep -v '"errors"' || { echo "Railway API returned errors"; exit 1; }
