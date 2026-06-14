@@ -121,24 +121,29 @@ def _run_gym_checkin() -> None:
         log.error(f"[SCHEDULED_GYM_CHECKIN] [FAIL] [{type(exc).__name__}]")
 
 
-def _run_midnight_shutdown() -> None:
-    """Clean exit at midnight SGT so Railway (ON_FAILURE policy) won't restart.
-    GitHub Actions cron restarts the service at 08:00 SGT — saves ~248 hrs/month."""
-    log.info("[SCHEDULED_SHUTDOWN] [MIDNIGHT] [BACKUP_START]")
+def _run_daily_shutdown() -> None:
+    """Clean exit at 03:00 SGT so Railway (ON_FAILURE policy) won't restart.
+    GitHub Actions redeploys the service at 13:00 SGT (05:00 UTC, off-peak for
+    the LA deploy gate). Uptime ~13:00–03:00 SGT ≈ 14 hrs/day ≈ 420 hrs/month,
+    under the 500 hr free-tier cap. The 08:00 SGT morning briefing runs on
+    GitHub Actions instead, since Railway can't wake before ~13:00 SGT without
+    hitting the peak-hour redeploy block."""
+    log.info("[SCHEDULED_SHUTDOWN] [DAILY] [BACKUP_START]")
     engine.backup_task_state_to_drive()
-    log.info("[SCHEDULED_SHUTDOWN] [MIDNIGHT] [SENDING_SIGTERM]")
+    log.info("[SCHEDULED_SHUTDOWN] [DAILY] [SENDING_SIGTERM]")
     os.kill(os.getpid(), signal.SIGTERM)
 
 
 def _setup_schedules() -> None:
     # Times in Singapore time (SGT = UTC+8)
-    # schedule library uses datetime.now() which respects the TZ env var
-    schedule.every().day.at("08:00").do(_run_morning_briefing)
+    # schedule library uses datetime.now() which respects the TZ env var.
+    # Morning briefing (08:00 SGT) runs on GitHub Actions — see
+    # .github/workflows/briefings.yml — because Railway is asleep then.
     schedule.every().day.at("15:00").do(_run_loyalty_lobby_digest)
     schedule.every().day.at("19:00").do(_run_evening_briefing)
     schedule.every().friday.at("20:00").do(_run_gym_checkin)
-    schedule.every().day.at("00:00").do(_run_midnight_shutdown)
-    log.info("[SCHEDULES_REGISTERED] [08:00_MORNING] [15:00_LOYALTY_LOBBY] [19:00_EVENING] [FRI_20:00_GYM_CHECKIN] [00:00_SHUTDOWN]")
+    schedule.every().day.at("03:00").do(_run_daily_shutdown)
+    log.info("[SCHEDULES_REGISTERED] [15:00_LOYALTY_LOBBY] [19:00_EVENING] [FRI_20:00_GYM_CHECKIN] [03:00_SHUTDOWN]")
 
 
 def _run_schedule_loop() -> None:
