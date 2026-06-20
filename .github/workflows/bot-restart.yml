@@ -9,7 +9,15 @@ name: Restart Bot at 1pm SGT
 
 on:
   schedule:
-    - cron: '0 5 * * *'  # 05:00 UTC = 13:00 SGT (off-peak)
+    # GitHub scheduled crons are best-effort: under load they get delayed hours
+    # or dropped with no retry. A single cron is a single point of failure (the
+    # bot stayed asleep past 15:00 SGT when the lone 05:00 run never fired).
+    # Fire several off-peak slots instead — redeploy is idempotent, so waking an
+    # already-up service is a harmless blip. Off-peak UTC (PDT+PST) = 04:00-15:00.
+    - cron: '0 5 * * *'    # 13:00 SGT
+    - cron: '30 5 * * *'   # 13:30 SGT
+    - cron: '0 6 * * *'    # 14:00 SGT
+    - cron: '30 6 * * *'   # 14:30 SGT
   workflow_dispatch:       # allow manual trigger from GitHub UI
 
 jobs:
