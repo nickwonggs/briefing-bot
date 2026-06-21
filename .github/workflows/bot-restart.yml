@@ -1,23 +1,23 @@
-name: Restart Bot at 1pm SGT
+name: Restart Bot right after peak ends
 
 # Wakes Railway by redeploying. MUST run outside the Railway free-tier
 # peak-hour deploy block (8 AM – 8 PM America/Los_Angeles).
 # Peak window in UTC: 15:00–03:00 (PDT) / 16:00–04:00 (PST).
-# 05:00 UTC = 13:00 SGT is off-peak year-round.
-# The old 00:00 UTC schedule = 5 PM LA = inside peak → redeploy rejected daily,
-# which is why the bot stayed asleep.
+# Peak ENDS at 03:00 UTC (PDT, summer) / 04:00 UTC (PST, winter).
+# Fire at peak-end so the bot wakes ASAP instead of waiting until 13:00 SGT.
 
 on:
   schedule:
     # GitHub scheduled crons are best-effort: under load they get delayed hours
-    # or dropped with no retry. A single cron is a single point of failure (the
-    # bot stayed asleep past 15:00 SGT when the lone 05:00 run never fired).
-    # Fire several off-peak slots instead — redeploy is idempotent, so waking an
-    # already-up service is a harmless blip. Off-peak UTC (PDT+PST) = 04:00-15:00.
-    - cron: '0 5 * * *'    # 13:00 SGT
-    - cron: '30 5 * * *'   # 13:30 SGT
-    - cron: '0 6 * * *'    # 14:00 SGT
-    - cron: '30 6 * * *'   # 14:30 SGT
+    # or dropped with no retry. A single cron is a single point of failure.
+    # Fire several slots from peak-end onward — redeploy is idempotent, so the
+    # first one that lands off-peak wins and the rest are harmless blips.
+    # 03:00 UTC is inside peak during PST, so the 04:00+ slots cover winter.
+    - cron: '0 3 * * *'    # 11:00 SGT — peak end (PDT), first wake
+    - cron: '30 3 * * *'   # 11:30 SGT
+    - cron: '0 4 * * *'    # 12:00 SGT — peak end (PST)
+    - cron: '30 4 * * *'   # 12:30 SGT
+    - cron: '0 5 * * *'    # 13:00 SGT — backstop
   workflow_dispatch:       # allow manual trigger from GitHub UI
 
 jobs:

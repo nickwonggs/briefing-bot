@@ -26,6 +26,7 @@ logging.basicConfig(
 from dotenv import load_dotenv
 
 import briefing_engine as engine
+import gym_engine as gym
 import loyalty_lobby
 import telegram_bot as tbot
 
@@ -51,10 +52,23 @@ def run_loyalty() -> None:
     loyalty_lobby.send_digest()
 
 
+def run_gym() -> None:
+    current = gym.current_split_name()
+    nxt = gym.next_split_name()
+    text = (
+        "🏋️ Weekly Gym Check-in!\n\n"
+        "Which days are you planning to gym next week?\n"
+        "Reply with: /days MON TUE WED THU FRI SAT SUN\n\n"
+        f"Current split: {current} Day — next session will be {nxt} Day."
+    )
+    asyncio.run(tbot.send_message(text))
+
+
 _JOBS = {
     "morning": run_morning,
     "evening": run_evening,
     "loyalty": run_loyalty,
+    "gym": run_gym,
 }
 
 

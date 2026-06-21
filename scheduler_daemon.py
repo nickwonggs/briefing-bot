@@ -2,16 +2,19 @@
 scheduler_daemon.py — Always-on process runner.
 
 Responsibilities:
-- Runs Telegram bot polling continuously
-- Fires evening briefing at 17:00 SGT daily
-- Fires morning briefing at 09:00 SGT daily
+- Runs Telegram bot polling continuously (interactive commands: /done, /add,
+  /days, tap-to-complete buttons). This is the ONLY reason Railway runs.
+- Fires the daily 03:00 SGT clean shutdown (Railway uptime cap workaround).
 - Health check HTTP endpoint on port 8080 (200 OK only)
 - Top-level exception handler: log error code, wait 30s, restart
 - Log rotation: 10MB per file, 3 rotations max
+
+All scheduled briefings (morning/evening/loyalty/gym) fire from GitHub Actions
+(.github/workflows/briefings.yml), not here — so they survive Railway being
+asleep. Do NOT re-add briefing schedules below or they'll double-fire.
 """
 
 # stdlib imports first
-import asyncio
 import logging
 import logging.handlers
 import os
@@ -42,8 +45,6 @@ from zoneinfo import ZoneInfo
 
 # Project imports (run after logging is configured)
 import briefing_engine as engine
-import gym_engine as gym
-import loyalty_lobby
 import telegram_bot as tbot
 
 load_dotenv()
@@ -74,60 +75,13 @@ def _start_health_server(port: int = 8080) -> None:
 
 # ── Scheduled jobs ─────────────────────────────────────────────────────────────
 
-def _run_evening_briefing() -> None:
-    log.info("[SCHEDULED_EVENING] [START]")
-    try:
-        target = engine.get_next_briefing_target()
-        text = engine.build_evening_briefing(target)
-        asyncio.run(tbot.send_message(text))
-        log.info("[SCHEDULED_EVENING] [OK]")
-    except Exception as exc:
-        log.error(f"[SCHEDULED_EVENING] [FAIL] [{type(exc).__name__}]")
-
-
-def _run_morning_briefing() -> None:
-    log.info("[SCHEDULED_MORNING] [START]")
-    try:
-        text = engine.build_morning_briefing()
-        asyncio.run(tbot.send_message(text))
-        log.info("[SCHEDULED_MORNING] [OK]")
-    except Exception as exc:
-        log.error(f"[SCHEDULED_MORNING] [FAIL] [{type(exc).__name__}]")
-
-
-def _run_loyalty_lobby_digest() -> None:
-    log.info("[SCHEDULED_LOYALTY_LOBBY] [START]")
-    try:
-        loyalty_lobby.send_digest()
-        log.info("[SCHEDULED_LOYALTY_LOBBY] [OK]")
-    except Exception as exc:
-        log.error(f"[SCHEDULED_LOYALTY_LOBBY] [FAIL] [{type(exc).__name__}]")
-
-
-def _run_gym_checkin() -> None:
-    log.info("[SCHEDULED_GYM_CHECKIN] [START]")
-    try:
-        current = gym.current_split_name()
-        nxt = gym.next_split_name()
-        text = (
-            "🏋️ Weekly Gym Check-in!\n\n"
-            "Which days are you planning to gym next week?\n"
-            "Reply with: /days MON TUE WED THU FRI SAT SUN\n\n"
-            f"Current split: {current} Day — next session will be {nxt} Day."
-        )
-        asyncio.run(tbot.send_message(text))
-        log.info("[SCHEDULED_GYM_CHECKIN] [OK]")
-    except Exception as exc:
-        log.error(f"[SCHEDULED_GYM_CHECKIN] [FAIL] [{type(exc).__name__}]")
-
-
 def _run_daily_shutdown() -> None:
     """Clean exit at 03:00 SGT so Railway (ON_FAILURE policy) won't restart.
-    GitHub Actions redeploys the service at 13:00 SGT (05:00 UTC, off-peak for
-    the LA deploy gate). Uptime ~13:00–03:00 SGT ≈ 14 hrs/day ≈ 420 hrs/month,
-    under the 500 hr free-tier cap. The 08:00 SGT morning briefing runs on
-    GitHub Actions instead, since Railway can't wake before ~13:00 SGT without
-    hitting the peak-hour redeploy block."""
+    GitHub Actions redeploys the service after the LA peak gate ends (~11:00
+    SGT) to wake it for interactive commands — see bot-restart.yml. Uptime
+    ~11:00–03:00 SGT ≈ 16 hrs/day ≈ 480 hrs/month, under the 500 hr free-tier
+    cap. All briefings run on GitHub Actions, so the bot being down overnight
+    only costs interactive commands, never a briefing."""
     log.info("[SCHEDULED_SHUTDOWN] [DAILY] [BACKUP_START]")
     engine.backup_task_state_to_drive()
     log.info("[SCHEDULED_SHUTDOWN] [DAILY] [SENDING_SIGTERM]")
@@ -135,15 +89,11 @@ def _run_daily_shutdown() -> None:
 
 
 def _setup_schedules() -> None:
-    # Times in Singapore time (SGT = UTC+8)
-    # schedule library uses datetime.now() which respects the TZ env var.
-    # Morning briefing (08:00 SGT) runs on GitHub Actions — see
-    # .github/workflows/briefings.yml — because Railway is asleep then.
-    schedule.every().day.at("15:00").do(_run_loyalty_lobby_digest)
-    schedule.every().day.at("19:00").do(_run_evening_briefing)
-    schedule.every().friday.at("20:00").do(_run_gym_checkin)
+    # Times in Singapore time (SGT = UTC+8); schedule lib respects the TZ env var.
+    # Only the daily shutdown lives here. All briefings run on GitHub Actions
+    # (.github/workflows/briefings.yml) — adding them back here double-fires them.
     schedule.every().day.at("03:00").do(_run_daily_shutdown)
-    log.info("[SCHEDULES_REGISTERED] [15:00_LOYALTY_LOBBY] [19:00_EVENING] [FRI_20:00_GYM_CHECKIN] [03:00_SHUTDOWN]")
+    log.info("[SCHEDULES_REGISTERED] [03:00_SHUTDOWN]")
 
 
 def _run_schedule_loop() -> None:

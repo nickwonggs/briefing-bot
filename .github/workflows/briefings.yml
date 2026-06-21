@@ -1,24 +1,26 @@
 name: Scheduled Briefings
 
-# Fires briefings from GitHub Actions instead of Railway, so they run even
-# when Railway is asleep or blocked by the peak-hour deploy gate.
+# All scheduled briefings fire from GitHub Actions, not Railway, so they run
+# even when Railway is asleep, blocked by the peak-hour deploy gate, or its
+# redeploy token is broken. Railway now only hosts the interactive Telegram
+# bot (commands like /done, /add, /days) — it no longer fires any briefing.
 #
-# Only the morning briefing runs here: 08:00 SGT lands during Railway's forced
-# overnight downtime (it can't wake before ~1pm SGT without hitting the LA
-# peak-hour redeploy block). Evening/loyalty/gym still run on the Railway
-# daemon, which is up at those times.
-#
-# Cron is UTC. 00:00 UTC = 08:00 SGT.
+# Each cron maps to one briefing (see the case statement below). Cron is UTC;
+# SGT = UTC+8. Single slot per briefing — briefings aren't idempotent, so no
+# redundant slots (unlike the redeploy in bot-restart.yml).
 
 on:
   schedule:
-    - cron: '0 0 * * *'   # 08:00 SGT — morning briefing
+    - cron: '0 0 * * *'    # 08:00 SGT — morning
+    - cron: '0 7 * * *'    # 15:00 SGT — loyalty lobby
+    - cron: '0 11 * * *'   # 19:00 SGT — evening
+    - cron: '0 12 * * 5'   # 20:00 SGT Fri — gym check-in
   workflow_dispatch:
     inputs:
       briefing:
         description: 'Which briefing to send'
         type: choice
-        options: [morning, evening, loyalty]
+        options: [morning, evening, loyalty, gym]
         default: morning
 
 jobs:
@@ -40,5 +42,12 @@ jobs:
           GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
           GOOGLE_TOKEN_JSON_PERSONAL: ${{ secrets.GOOGLE_TOKEN_JSON_PERSONAL }}
         run: |
-          BRIEFING="${{ github.event.inputs.briefing }}"
+          # Map the firing cron to a briefing. On manual dispatch, use the input.
+          case "${{ github.event.schedule }}" in
+            "0 0 * * *")   BRIEFING=morning ;;
+            "0 7 * * *")   BRIEFING=loyalty ;;
+            "0 11 * * *")  BRIEFING=evening ;;
+            "0 12 * * 5")  BRIEFING=gym ;;
+            *)             BRIEFING="${{ github.event.inputs.briefing }}" ;;
+          esac
           python run_briefing.py "${BRIEFING:-morning}"
