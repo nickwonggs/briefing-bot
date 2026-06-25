@@ -30,8 +30,33 @@ jobs:
           SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
           ENVIRONMENT_ID: ${{ secrets.RAILWAY_ENVIRONMENT_ID }}
         run: |
-          curl -sf -X POST https://backboard.railway.app/graphql/v2 \
-            -H "Authorization: Bearer $RAILWAY_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{\"query\":\"mutation { serviceInstanceRedeploy(serviceId: \\\"$SERVICE_ID\\\", environmentId: \\\"$ENVIRONMENT_ID\\\") }\"}" \
-            | tee /dev/stderr | grep -v '"errors"' || { echo "Railway API returned errors"; exit 1; }
+          set -euo pipefail
+
+          query="{\"query\":\"mutation { serviceInstanceRedeploy(serviceId: \\\"$SERVICE_ID\\\", environmentId: \\\"$ENVIRONMENT_ID\\\") }\"}"
+
+          # Railway has two token types that authenticate via different headers:
+          #   - account/team token  -> Authorization: Bearer <token>
+          #   - project token       -> Project-Access-Token: <token>
+          # Try the account-token header first, then fall back to the project
+          # header, so a token-type mix-up doesn't silently break the wake-up.
+          for header in "Authorization: Bearer $RAILWAY_TOKEN" "Project-Access-Token: $RAILWAY_TOKEN"; do
+            scheme="${header%%:*}"
+            echo "Attempting redeploy with $scheme header..."
+            resp=$(curl -s -X POST https://backboard.railway.app/graphql/v2 \
+              -H "$header" \
+              -H "Content-Type: application/json" \
+              -d "$query")
+            echo "Response: $resp"
+
+            if echo "$resp" | grep -q '"errors"'; then
+              echo "::warning::Redeploy failed with $scheme header"
+              continue
+            fi
+            echo "Redeploy accepted ($scheme)."
+            exit 0
+          done
+
+          echo "::error::Railway redeploy was Not Authorized with every token type."
+          echo "::error::Regenerate RAILWAY_TOKEN (Account Settings -> Tokens) and update the GitHub secret."
+          exit 1
+
